@@ -1,0 +1,12 @@
+node_modules/
+dist/
+out/
+.pi/cases/
+.pi/sessions/
+.pi/runtime/
+.pi/desktop-settings.json
+.pi/mcp.local.json
+.pi/skills/
+.pi/*.json
+!.pi/mobile-reverse.example.json
+*.log

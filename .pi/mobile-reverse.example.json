@@ -1,0 +1,22 @@
+{
+  "caseRoot": ".pi/cases",
+  "mcpServers": {
+    "jadx": {
+      "transport": "stdio",
+      "command": "C:\\Python311\\python.exe",
+      "args": ["C:\\tools\\jadx-mcp-server\\jadx_mcp_server.py", "--jadx-port", "8650"],
+      "timeoutMs": 120000
+    },
+    "ida": {
+      "transport": "http",
+      "url": "http://127.0.0.1:13337/mcp",
+      "timeoutMs": 120000
+    },
+    "frida": {
+      "transport": "stdio",
+      "command": "frida-mcp",
+      "args": [],
+      "timeoutMs": 180000
+    }
+  }
+}

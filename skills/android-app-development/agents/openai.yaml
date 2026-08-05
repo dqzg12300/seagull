@@ -1,0 +1,4 @@
+interface:
+  display_name: "Android App Development"
+  short_description: "Build new Android apps using inherited case knowledge"
+  default_prompt: "Use $android-app-development to build and verify a new Android application from the current case requirements and inherited evidence."

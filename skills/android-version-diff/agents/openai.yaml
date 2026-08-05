@@ -1,0 +1,4 @@
+interface:
+  display_name: "Android Version Diff"
+  short_description: "Compare APK versions and migrate prior reverse findings"
+  default_prompt: "Use $android-version-diff to compare these Android application versions and migrate prior findings."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Android App Reconstruction"
+  short_description: "Rebuild Android apps from inherited reverse-engineering artifacts"
+  default_prompt: "Use $android-app-reconstruction to reconstruct an Android application from inherited deobfuscation artifacts."

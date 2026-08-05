@@ -1,0 +1,4 @@
+interface:
+  display_name: "Android Runtime Diagnostics"
+  short_description: "Diagnose live Android crashes, errors, and bad runtime data"
+  default_prompt: "Use $android-runtime-diagnostics to diagnose this issue on the connected Android device."

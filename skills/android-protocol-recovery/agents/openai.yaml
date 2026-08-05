@@ -1,0 +1,4 @@
+interface:
+  display_name: "Android Protocol Recovery"
+  short_description: "Recover Android framing, fields, signing, and protocol state"
+  default_prompt: "Use $android-protocol-recovery to recover and verify this Android application protocol."
