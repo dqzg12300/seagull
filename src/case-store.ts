@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile, appendFile, stat } from "node:fs/promises";
+import { mkdir, readFile, writeFile, appendFile, stat, open, unlink } from "node:fs/promises";
 import path from "node:path";
 
 export type CasePhase =
@@ -78,7 +78,7 @@ function safeCaseId(value: string): string {
 
 export class CaseStore {
   private activeId?: string;
-  constructor(private readonly root: string) {}
+  constructor(private readonly root: string, private readonly boundWorkId?: string) {}
 
   get activeCaseId(): string | undefined { return this.activeId; }
   caseDir(id = this.requireActive()): string { return path.join(this.root, safeCaseId(id)); }
@@ -109,7 +109,8 @@ export class CaseStore {
   }
 
   async load(id = this.requireActive()): Promise<CaseState> {
-    return JSON.parse(await readFile(path.join(this.caseDir(id), "state.json"), "utf8")) as CaseState;
+    const state = JSON.parse(await readFile(path.join(this.caseDir(id), "state.json"), "utf8")) as CaseState;
+    return this.bindWork(state);
   }
 
   async update(patch: Partial<Pick<CaseState, "phase" | "target" | "sha256">> & { note?: string; artifact?: string }): Promise<CaseState> {
@@ -183,8 +184,9 @@ export class CaseStore {
   }
 
   private async save(state: CaseState): Promise<void> {
-    if (state.activeWorkId && state.activeRun && state.works) {
-      const activeWork = state.works.find(work => work.id === state.activeWorkId);
+    const workId = this.boundWorkId ?? state.activeWorkId;
+    if (workId && state.activeRun && state.works) {
+      const activeWork = state.works.find(work => work.id === workId);
       if (activeWork) {
         activeWork.run = structuredClone(state.activeRun);
         activeWork.status = state.activeRun.status;
@@ -206,7 +208,66 @@ export class CaseStore {
       }
     }
     await mkdir(this.caseDir(state.id), { recursive: true });
-    await writeFile(path.join(this.caseDir(state.id), "state.json"), JSON.stringify(state, null, 2) + "\n");
+    await this.withStateLock(state.id, async () => {
+      const stateFile = path.join(this.caseDir(state.id), "state.json");
+      let latest: CaseState | undefined;
+      try { latest = JSON.parse(await readFile(stateFile, "utf8")) as CaseState; } catch { /* first save */ }
+      if (!latest || !workId || !state.works) {
+        await writeFile(stateFile, JSON.stringify(state, null, 2) + "\n");
+        return;
+      }
+      latest.works ??= [];
+      const desired = state.works.find(work => work.id === workId);
+      const latestIndex = latest.works.findIndex(work => work.id === workId);
+      if (desired) {
+        const merged = { ...(latestIndex >= 0 ? latest.works[latestIndex] : undefined), ...desired, run: structuredClone(state.activeRun ?? desired.run), status: (state.activeRun ?? desired.run).status, updatedAt: (state.activeRun ?? desired.run).updatedAt } as Work;
+        if (latestIndex >= 0) latest.works[latestIndex] = merged;
+        else latest.works.push(merged);
+        if (latest.activeWorkId === workId) {
+          latest.activeRun = structuredClone(merged.run);
+          latest.analysisGoal = merged.goal;
+          latest.analysisCategory = merged.category;
+          latest.phase = state.phase;
+        }
+      }
+      latest.notes = [...new Set([...(latest.notes ?? []), ...(state.notes ?? [])])];
+      latest.artifacts = [...new Set([...(latest.artifacts ?? []), ...(state.artifacts ?? [])])];
+      latest.updatedAt = Date.parse(state.updatedAt) > Date.parse(latest.updatedAt) ? state.updatedAt : latest.updatedAt;
+      await writeFile(stateFile, JSON.stringify(latest, null, 2) + "\n");
+    });
+  }
+
+  private bindWork(state: CaseState): CaseState {
+    if (!this.boundWorkId || !state.works) return state;
+    const work = state.works.find(item => item.id === this.boundWorkId);
+    if (!work) return state;
+    state.activeWorkId = work.id;
+    state.activeRun = structuredClone(work.run);
+    state.analysisGoal = work.goal;
+    state.analysisCategory = work.category;
+    return state;
+  }
+
+  private async withStateLock<T>(id: string, action: () => Promise<T>): Promise<T> {
+    const lockFile = path.join(this.caseDir(id), ".state.lock");
+    let handle;
+    for (let attempt = 0; attempt < 240; attempt += 1) {
+      try { handle = await open(lockFile, "wx"); break; }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        try {
+          const info = await stat(lockFile);
+          if (Date.now() - info.mtimeMs > 120_000) await unlink(lockFile);
+        } catch { /* another process released it */ }
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+    }
+    if (!handle) throw new Error(`Timed out locking CASE state: ${id}`);
+    try { return await action(); }
+    finally {
+      await handle.close();
+      try { await unlink(lockFile); } catch { /* already removed */ }
+    }
   }
 
   private requireActive(): string {

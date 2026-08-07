@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { chooseGradleScript, decodeProcessText, parseGradleDistributionProperties, windowsBatchCommand } from "../electron/gradle-support.js";
+import { chooseGradleScript, decodeProcessText, gradleBuildTasks, gradleLockedCleanDirectories, parseGradleDistributionProperties, windowsBatchCommand } from "../electron/gradle-support.js";
 
 describe("Gradle build support", () => {
   it("uses a matching cached distribution when the wrapper JAR is missing", () => {
@@ -20,5 +20,14 @@ describe("Gradle build support", () => {
 
   it("wraps a Windows batch path for cmd /s /c without escaped quote literals", () => {
     expect(windowsBatchCommand("C:\\Users\\Test User\\.gradle\\gradle.bat", ["assembleDebug"])).toBe('""C:\\Users\\Test User\\.gradle\\gradle.bat" assembleDebug"');
+  });
+
+  it("uses clean before assembleDebug for a full rebuild", () => {
+    expect(gradleBuildTasks(false)).toEqual(["assembleDebug"]);
+    expect(gradleBuildTasks(true)).toEqual(["--no-daemon", "clean", "assembleDebug"]);
+  });
+
+  it("extracts Windows output directories that Gradle cleaned but could not remove", () => {
+    expect(gradleLockedCleanDirectories("java.io.IOException: Unable to delete directory 'D:\\project\\app\\build'")).toEqual(["D:\\project\\app\\build"]);
   });
 });

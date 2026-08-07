@@ -36,3 +36,11 @@ export function windowsBatchCommand(script: string, args: string[]): string {
   const command = [`"${script.replaceAll('"', '""')}"`, ...args.map(quote)].join(" ");
   return `"${command}"`;
 }
+
+export function gradleBuildTasks(clean: boolean): string[] {
+  return clean ? ["--no-daemon", "clean", "assembleDebug"] : ["assembleDebug"];
+}
+
+export function gradleLockedCleanDirectories(output: string): string[] {
+  return [...output.matchAll(/Unable to delete directory '([^']+)'/g)].map(match => match[1]).filter((value): value is string => Boolean(value));
+}

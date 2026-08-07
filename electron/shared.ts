@@ -1,16 +1,31 @@
 export type WorkerCommand =
-  | { type: "initialize"; cwd: string; caseId?: string; caseRoot?: string; settings?: AppSettings }
+  | { type: "initialize"; cwd: string; caseId?: string; workId?: string; caseRoot?: string; settings?: AppSettings; invalidate?: boolean }
   | { type: "prompt"; text: string; images?: ImageAttachment[] }
   | { type: "abort" }
   | { type: "shutdown" };
 
 export type WorkerEvent =
-  | { type: "ready"; sessionId: string; sessionFile?: string; tools: string[]; history?: unknown[] }
+  | { type: "ready"; sessionId: string; sessionFile?: string; tools: string[]; history?: unknown[]; cacheHit?: boolean }
   | { type: "tools"; tools: string[] }
   | { type: "agent-event"; event: unknown }
   | { type: "state"; streaming: boolean; model?: string; thinkingLevel?: string }
   | { type: "error"; message: string; stack?: string }
-  | { type: "log"; channel: string; message: string };
+  | { type: "log"; channel: string; message: string }
+  | { type: "queue"; items: PromptQueueItemView[] };
+
+export type RoutedWorkerEvent = WorkerEvent & { sessionKey?: string; caseId?: string; workId?: string };
+
+export type PromptQueueStatus = "queued" | "running";
+export interface PromptQueueItemView {
+  id: string;
+  caseId?: string;
+  workId?: string;
+  displayText: string;
+  status: PromptQueueStatus;
+  createdAt: string;
+  updatedAt: string;
+  imageCount: number;
+}
 
 export interface CaseStateView {
   id: string;
@@ -110,6 +125,7 @@ export interface SkillInfo {
 }
 export interface DirectoryEntryInfo { name: string; path: string; type: "file" | "directory" }
 export interface AttachedFileInfo { name: string; path: string; size: number; extension: string }
+export interface CaseWorkSummary { id: string; title: string; category: AnalysisCategory; createdAt: string }
 export interface CaseSummary {
   id: string;
   target?: string;
@@ -122,6 +138,7 @@ export interface CaseSummary {
   title?: string;
   platform?: CasePlatform;
   inputCount?: number;
+  works?: CaseWorkSummary[];
 }
 
 export interface DesktopApi {
@@ -132,11 +149,12 @@ export interface DesktopApi {
   listAdbPackages(): Promise<AdbPackageInfo[]>;
   listAdbDevices(): Promise<AdbDeviceInfo[]>;
   listWorkApks(caseId: string, workId: string): Promise<InstallableApk[]>;
-  buildWork(caseId: string, workId: string): Promise<WorkActionResult>;
+  buildWork(caseId: string, workId: string, clean?: boolean): Promise<WorkActionResult>;
   installWorkApk(serial: string, apkPath: string): Promise<WorkActionResult>;
   createCase(request: CreateCaseRequest): Promise<CaseStateView>;
   addCaseInputs(caseId: string, inputs: CaseInputDraft[]): Promise<CaseStateView>;
   openCaseInput(caseId: string, inputId: string): Promise<void>;
+  revealCaseInput(caseId: string, inputId: string): Promise<void>;
   selectOutputDirectory(): Promise<string | undefined>;
   importAttachments(caseId: string, workId?: string): Promise<AttachedFileInfo[]>;
   openCaseDirectory(caseId: string): Promise<void>;
@@ -144,6 +162,7 @@ export interface DesktopApi {
   openArtifact(filename: string): Promise<void>;
   revealArtifact(filename: string): Promise<void>;
   openArtifactTerminal(filename: string): Promise<void>;
+  openExternal(url: string): Promise<void>;
   createTerminal(cwd: string, title?: string, initialCommand?: string): Promise<TerminalSessionInfo>;
   writeTerminal(terminalId: string, data: string): void;
   resizeTerminal(terminalId: string, cols: number, rows: number): void;
@@ -153,12 +172,16 @@ export interface DesktopApi {
   searchSkills(query: string): Promise<SkillInfo[]>;
   installSkill(idOrUrl: string): Promise<SkillInfo>;
   identifyApk(filename: string): Promise<{ caseId: string; existing?: CaseStateView }>;
-  initialize(caseId?: string, force?: boolean): Promise<void>;
+  initialize(caseId?: string, workId?: string, force?: boolean): Promise<void>;
   getSettings(): Promise<AppSettings>;
   saveSettings(settings: AppSettings): Promise<void>;
   listModels(settings: AppSettings): Promise<string[]>;
-  prompt(text: string, images?: ImageAttachment[]): Promise<void>;
-  abort(): Promise<void>;
+  prompt(caseId: string | undefined, workId: string | undefined, text: string, displayText: string, images?: ImageAttachment[]): Promise<PromptQueueItemView>;
+  abort(caseId?: string, workId?: string): Promise<void>;
+  listPromptQueue(caseId?: string, workId?: string): Promise<PromptQueueItemView[]>;
+  updateQueuedPrompt(caseId: string | undefined, workId: string | undefined, promptId: string, displayText: string): Promise<PromptQueueItemView[]>;
+  moveQueuedPrompt(caseId: string | undefined, workId: string | undefined, promptId: string, direction: "up" | "down"): Promise<PromptQueueItemView[]>;
+  deleteQueuedPrompt(caseId: string | undefined, workId: string | undefined, promptId: string): Promise<PromptQueueItemView[]>;
   readCase(caseId: string): Promise<CaseStateView | undefined>;
   listCases(): Promise<CaseSummary[]>;
   deleteCase(caseId: string): Promise<boolean>;
@@ -168,8 +191,9 @@ export interface DesktopApi {
   switchWork(caseId: string, workId: string): Promise<CaseStateView>;
   deleteWork(caseId: string, workId: string): Promise<CaseStateView>;
   renameWork(caseId: string, workId: string, title: string): Promise<CaseStateView>;
+  updateWork(caseId: string, workId: string, update: { title: string; category: AnalysisCategory }): Promise<CaseStateView>;
   readTextFile(filename: string): Promise<string>;
   listDirectory(directory: string): Promise<DirectoryEntryInfo[]>;
-  onWorkerEvent(listener: (event: WorkerEvent) => void): () => void;
+  onWorkerEvent(listener: (event: RoutedWorkerEvent) => void): () => void;
   onTerminalEvent(listener: (event: TerminalEvent) => void): () => void;
 }

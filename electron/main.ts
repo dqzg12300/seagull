@@ -2,25 +2,69 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage, shell } from "e
 import { execFile, fork, spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { appendFile, copyFile, mkdir, open, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { appendFile, copyFile, mkdir, open, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import net from "node:net";
 import { promisify } from "node:util";
 import * as pty from "node-pty";
 import type { IPty } from "node-pty";
-import type { AdbDeviceInfo, AnalysisCategory, AppSettings, CaseInput, CaseInputDraft, CreateCaseRequest, ImageAttachment, InstallableApk, TerminalEvent, TerminalSessionInfo, WorkerCommand, WorkerEvent } from "./shared.js";
+import type { AdbDeviceInfo, AnalysisCategory, AppSettings, CaseInput, CaseInputDraft, CaseSummary, CreateCaseRequest, ImageAttachment, InstallableApk, PromptQueueItemView, RoutedWorkerEvent, TerminalEvent, TerminalSessionInfo, WorkerCommand, WorkerEvent } from "./shared.js";
 import { installSkill, listSkills, searchSkills } from "./skills-manager.js";
-import { chooseGradleScript, decodeProcessText, parseGradleDistributionProperties, windowsBatchCommand } from "./gradle-support.js";
+import { chooseGradleScript, decodeProcessText, gradleBuildTasks, gradleLockedCleanDirectories, parseGradleDistributionProperties, windowsBatchCommand } from "./gradle-support.js";
+import { applyLegacyWorkInheritance } from "./work-session.js";
+import { orderedCaseWorkSummaries } from "./case-summary.js";
+import { applyWorkMetadataUpdate } from "./work-metadata.js";
+import { moveQueuedPrompt, promptQueueView, replaceQueuedPromptDisplay, type StoredPromptQueueItem } from "./prompt-queue.js";
+import { allIndexedArtifacts, rebuildWorkArtifactOwnership } from "./work-artifacts.js";
 
 const projectRoot = path.resolve(__dirname, "../..");
 let mainWindow: BrowserWindow | undefined;
-let worker: ChildProcess | undefined;
-let pendingInitialization: { key: string; resolves: Array<() => void>; rejects: Array<(error: Error) => void>; timer: NodeJS.Timeout } | undefined;
-let activeInitializationKey: string | undefined;
+type AgentRuntime = {
+  key: string;
+  caseId?: string;
+  workId?: string;
+  worker: ChildProcess;
+  ready: boolean;
+  streaming: boolean;
+  paused: boolean;
+  currentPromptId?: string;
+  pendingInitialization?: { resolves: Array<() => void>; rejects: Array<(error: Error) => void>; timer: NodeJS.Timeout };
+  journal: WorkerEvent[];
+  queue?: StoredPromptQueueItem[];
+  queueTask: Promise<unknown>;
+};
+const agentRuntimes = new Map<string, AgentRuntime>();
 const terminals = new Map<string, { info: TerminalSessionInfo; process: IPty }>();
 const settingsFile = path.join(projectRoot, ".pi", "desktop-settings.json");
 const legacyCasesRoot = path.join(projectRoot, ".pi", "cases");
 const execFileAsync = promisify(execFile);
+
+async function withCaseStateLock<T>(caseDir: string, action: () => Promise<T>): Promise<T> {
+  const lockFile = path.join(caseDir, ".state.lock");
+  let handle;
+  for (let attempt = 0; attempt < 240; attempt += 1) {
+    try { handle = await open(lockFile, "wx"); break; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      try { if (Date.now() - (await stat(lockFile)).mtimeMs > 120_000) await unlink(lockFile); } catch { /* released */ }
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+  }
+  if (!handle) throw new Error("Timed out locking CASE state");
+  try { return await action(); }
+  finally { await handle.close(); try { await unlink(lockFile); } catch { /* released */ } }
+}
+
+async function mutateCaseState<T = unknown>(caseId: string, mutate: (state: any, caseDir: string) => Promise<T> | T): Promise<{ state: any; result: T }> {
+  const caseDir = await findCaseDir(caseId);
+  return withCaseStateLock(caseDir, async () => {
+    const stateFile = path.join(caseDir, "state.json");
+    const state = JSON.parse(await readFile(stateFile, "utf8"));
+    const result = await mutate(state, caseDir);
+    await writeFile(stateFile, JSON.stringify(state, null, 2) + "\n");
+    return { state, result };
+  });
+}
 
 function sendTerminalEvent(event: TerminalEvent): void {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("terminal:event", event);
@@ -32,6 +76,49 @@ function commandFailure(label: string, error: unknown): Error {
   const stderr = decodeProcessText(detail.stderr).trim();
   const tail = [stderr, stdout].filter(Boolean).join("\n").slice(-4_000);
   return new Error(`${label} failed${tail ? `:\n${tail}` : detail.message ? `: ${detail.message}` : ""}`);
+}
+
+function commandOutput(error: unknown): string {
+  const detail = error as Error & { stdout?: string | Buffer; stderr?: string | Buffer };
+  return [decodeProcessText(detail.stderr), decodeProcessText(detail.stdout), detail.message].filter(Boolean).join("\n");
+}
+
+async function directoryContainsFile(directory: string): Promise<boolean> {
+  let entries;
+  try { entries = await readdir(directory, { withFileTypes: true }); }
+  catch { return false; }
+  for (const entry of entries) {
+    if (entry.isFile()) return true;
+    if (entry.isDirectory() && await directoryContainsFile(path.join(directory, entry.name))) return true;
+  }
+  return false;
+}
+
+async function cleanRemovedAllFiles(error: unknown, projectDir: string): Promise<boolean> {
+  const matches = gradleLockedCleanDirectories(commandOutput(error));
+  if (!matches.length) return false;
+  const normalizedProject = path.resolve(projectDir).toLowerCase();
+  for (const candidate of matches) {
+    const resolved = path.resolve(candidate);
+    const normalized = resolved.toLowerCase();
+    if (normalized !== normalizedProject && !normalized.startsWith(normalizedProject + path.sep)) return false;
+    if (await directoryContainsFile(resolved)) return false;
+  }
+  return true;
+}
+
+async function closeIntegratedBuildTerminals(projectDir: string): Promise<void> {
+  let closed = false;
+  const normalizedProject = path.resolve(projectDir).toLowerCase();
+  for (const terminal of terminals.values()) {
+    const cwd = path.resolve(terminal.info.cwd);
+    const normalized = cwd.toLowerCase();
+    if (normalized !== normalizedProject && !normalized.startsWith(normalizedProject + path.sep)) continue;
+    const relativeParts = path.relative(projectDir, cwd).split(path.sep).map(part => part.toLowerCase());
+    if (!relativeParts.includes("build")) continue;
+    try { terminal.process.kill(); closed = true; } catch { /* already exited */ }
+  }
+  if (closed) await new Promise(resolve => setTimeout(resolve, 180));
 }
 
 async function isFile(filename: string): Promise<boolean> {
@@ -89,7 +176,7 @@ async function javaHomeForBuild(): Promise<string | undefined> {
   }
 }
 
-async function gradleBuildInvocation(projectDir: string): Promise<{ executable: string; args: string[]; source: "wrapper" | "cache" | "path"; windowsVerbatimArguments?: boolean }> {
+async function gradleBuildInvocation(projectDir: string, tasks: string[]): Promise<{ executable: string; args: string[]; source: "wrapper" | "cache" | "path"; windowsVerbatimArguments?: boolean }> {
   const wrapper = path.join(projectDir, process.platform === "win32" ? "gradlew.bat" : "gradlew");
   const wrapperJar = path.join(projectDir, "gradle", "wrapper", "gradle-wrapper.jar");
   const wrapperExists = await isFile(wrapper);
@@ -113,10 +200,10 @@ async function gradleBuildInvocation(projectDir: string): Promise<{ executable: 
   }
   const { script, source } = selected;
   if (process.platform === "win32") {
-    const command = windowsBatchCommand(script, ["assembleDebug"]);
+    const command = windowsBatchCommand(script, tasks);
     return { executable: process.env.ComSpec || "cmd.exe", args: ["/d", "/s", "/c", command], source, windowsVerbatimArguments: true };
   }
-  return { executable: script, args: ["assembleDebug"], source };
+  return { executable: script, args: tasks, source };
 }
 
 async function adbDevices(): Promise<AdbDeviceInfo[]> {
@@ -256,41 +343,145 @@ async function listModels(settings: AppSettings): Promise<string[]> {
   return [...new Set(models)];
 }
 
-function createWorker(): ChildProcess {
-  if (worker && !worker.killed) return worker;
+function sessionKey(caseId?: string, workId?: string): string {
+  return caseId ? `${caseId}:${workId ?? "case"}` : "workspace";
+}
+
+function routed(runtime: AgentRuntime, event: WorkerEvent): RoutedWorkerEvent {
+  return { ...event, sessionKey: runtime.key, caseId: runtime.caseId, workId: runtime.workId } as RoutedWorkerEvent;
+}
+
+function emitWorkerEvent(runtime: AgentRuntime, event: WorkerEvent): void {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("worker:event", routed(runtime, event));
+}
+
+async function queueFilename(runtime: AgentRuntime): Promise<string> {
+  if (runtime.caseId) {
+    const caseDir = await findCaseDir(runtime.caseId);
+    const directory = path.join(caseDir, ".queues");
+    await mkdir(directory, { recursive: true });
+    return path.join(directory, `${runtime.workId ?? "case"}.json`);
+  }
+  const directory = path.join(projectRoot, ".pi", "queues");
+  await mkdir(directory, { recursive: true });
+  return path.join(directory, "workspace.json");
+}
+
+async function ensurePromptQueue(runtime: AgentRuntime): Promise<StoredPromptQueueItem[]> {
+  if (runtime.queue) return runtime.queue;
+  try {
+    const parsed = JSON.parse(await readFile(await queueFilename(runtime), "utf8"));
+    runtime.queue = Array.isArray(parsed) ? parsed.map((item: StoredPromptQueueItem) => ({ ...item, status: "queued" as const })) : [];
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    runtime.queue = [];
+  }
+  return runtime.queue;
+}
+
+async function persistPromptQueue(runtime: AgentRuntime): Promise<void> {
+  const queue = await ensurePromptQueue(runtime);
+  await writeFile(await queueFilename(runtime), JSON.stringify(queue, null, 2) + "\n");
+}
+
+async function emitPromptQueue(runtime: AgentRuntime): Promise<PromptQueueItemView[]> {
+  const views = (await ensurePromptQueue(runtime)).map(promptQueueView);
+  emitWorkerEvent(runtime, { type: "queue", items: views });
+  return views;
+}
+
+function serializeQueueOperation<T>(runtime: AgentRuntime, operation: () => Promise<T>): Promise<T> {
+  const result = runtime.queueTask.then(operation, operation);
+  runtime.queueTask = result.then(() => undefined, () => undefined);
+  return result;
+}
+
+async function dispatchNextPrompt(runtime: AgentRuntime): Promise<void> {
+  if (!runtime.ready || runtime.streaming || runtime.paused) return;
+  const queue = await ensurePromptQueue(runtime);
+  const next = queue.find(item => item.status === "queued");
+  if (!next) return;
+  next.status = "running";
+  next.updatedAt = new Date().toISOString();
+  runtime.currentPromptId = next.id;
+  runtime.streaming = true;
+  await persistPromptQueue(runtime);
+  await emitPromptQueue(runtime);
+  runtime.worker.send({ type: "prompt", text: next.agentText, images: next.images } satisfies WorkerCommand);
+}
+
+async function finishCurrentPrompt(runtime: AgentRuntime): Promise<void> {
+  if (!runtime.currentPromptId) return;
+  const queue = await ensurePromptQueue(runtime);
+  runtime.queue = queue.filter(item => item.id !== runtime.currentPromptId);
+  runtime.currentPromptId = undefined;
+  runtime.streaming = false;
+  await persistPromptQueue(runtime);
+  await emitPromptQueue(runtime);
+  await dispatchNextPrompt(runtime);
+}
+
+function createWorkerRuntime(caseId?: string, workId?: string): AgentRuntime {
+  const key = sessionKey(caseId, workId);
+  const existing = agentRuntimes.get(key);
+  if (existing && !existing.worker.killed) return existing;
   const workerFile = path.join(__dirname, "agent-worker.js");
-  worker = fork(workerFile, [], {
+  const child = fork(workerFile, [], {
     cwd: projectRoot,
     execPath: process.execPath,
     env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
     stdio: ["ignore", "pipe", "pipe", "ipc"],
   });
-  worker.on("message", event => {
+  const runtime: AgentRuntime = { key, caseId, workId, worker: child, ready: false, streaming: false, paused: false, journal: [], queueTask: Promise.resolve() };
+  agentRuntimes.set(key, runtime);
+  child.on("message", event => {
     const message = event as WorkerEvent;
-    if (message.type === "ready" && pendingInitialization) {
-      clearTimeout(pendingInitialization.timer);
-      activeInitializationKey = pendingInitialization.key;
-      for (const resolve of pendingInitialization.resolves) resolve();
-      pendingInitialization = undefined;
+    if (message.type === "ready") {
+      runtime.ready = true;
+      runtime.journal = [message];
+      const pending = runtime.pendingInitialization;
+      if (pending) {
+        clearTimeout(pending.timer);
+        runtime.pendingInitialization = undefined;
+        for (const resolve of pending.resolves) resolve();
+      }
+      void serializeQueueOperation(runtime, async () => { await emitPromptQueue(runtime); await dispatchNextPrompt(runtime); });
+    } else {
+      runtime.journal.push(message);
+      if (runtime.journal.length > 10_000) runtime.journal.splice(1, runtime.journal.length - 10_000);
     }
-    if (message.type === "error" && pendingInitialization) {
-      clearTimeout(pendingInitialization.timer);
-      for (const reject of pendingInitialization.rejects) reject(new Error(message.message));
-      pendingInitialization = undefined;
+    if (message.type === "state") runtime.streaming = message.streaming || Boolean(runtime.currentPromptId);
+    if (message.type === "error" && runtime.pendingInitialization) {
+      const pending = runtime.pendingInitialization;
+      clearTimeout(pending.timer);
+      runtime.pendingInitialization = undefined;
+      for (const reject of pending.rejects) reject(new Error(message.message));
     }
-    mainWindow?.webContents.send("worker:event", message);
+    emitWorkerEvent(runtime, message);
+    if (message.type === "error" && runtime.currentPromptId) {
+      void serializeQueueOperation(runtime, async () => {
+        const queue = await ensurePromptQueue(runtime);
+        const current = queue.find(item => item.id === runtime.currentPromptId);
+        if (current) { current.status = "queued"; current.updatedAt = new Date().toISOString(); }
+        runtime.currentPromptId = undefined;
+        runtime.streaming = false;
+        runtime.paused = true;
+        await persistPromptQueue(runtime);
+        await emitPromptQueue(runtime);
+      });
+    }
+    if (message.type === "agent-event" && (message.event as { type?: string } | undefined)?.type === "agent_end") {
+      void serializeQueueOperation(runtime, () => finishCurrentPrompt(runtime));
+    }
   });
-  worker.stdout?.on("data", chunk => mainWindow?.webContents.send("worker:event", { type: "log", channel: "pi", message: chunk.toString() } satisfies WorkerEvent));
-  worker.stderr?.on("data", chunk => mainWindow?.webContents.send("worker:event", { type: "log", channel: "error", message: chunk.toString() } satisfies WorkerEvent));
-  worker.on("exit", code => {
-    mainWindow?.webContents.send("worker:event", { type: "log", channel: "system", message: `Agent worker exited (${code})` } satisfies WorkerEvent);
-    worker = undefined;
-    activeInitializationKey = undefined;
+  child.stdout?.on("data", chunk => emitWorkerEvent(runtime, { type: "log", channel: "pi", message: chunk.toString() }));
+  child.stderr?.on("data", chunk => emitWorkerEvent(runtime, { type: "log", channel: "error", message: chunk.toString() }));
+  child.on("exit", code => {
+    emitWorkerEvent(runtime, { type: "log", channel: "system", message: `Agent worker exited (${code})` });
+    agentRuntimes.delete(key);
   });
-  return worker;
+  return runtime;
 }
-
-function send(command: WorkerCommand): void { createWorker().send(command); }
 
 async function hashFile(filename: string): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -300,8 +491,8 @@ async function hashFile(filename: string): Promise<string> {
   });
 }
 
-async function withArtifactTypes<T extends { artifacts?: string[] }>(state: T): Promise<T & { artifactTypes: Record<string, "file" | "directory" | "missing"> }> {
-  const entries = await Promise.all((state.artifacts ?? []).map(async artifact => {
+async function withArtifactTypes<T extends { artifacts?: string[]; works?: Array<{ artifacts?: string[]; artifactSnapshot?: string[] }> }>(state: T): Promise<T & { artifactTypes: Record<string, "file" | "directory" | "missing"> }> {
+  const entries = await Promise.all(allIndexedArtifacts(state).map(async artifact => {
     try { const info = await stat(artifact); return [artifact, info.isDirectory() ? "directory" : "file"] as const; }
     catch { return [artifact, "missing"] as const; }
   }));
@@ -324,6 +515,10 @@ function migrateLegacyWorks(state: any): boolean {
   });
   state.activeWorkId = state.activeRun?.requestId ?? state.works.at(-1)?.id;
   return true;
+}
+
+function ensureLegacyWorkInheritance(state: any): boolean {
+  return Array.isArray(state.works) && applyLegacyWorkInheritance(state.works);
 }
 
 async function createWindow(): Promise<void> {
@@ -387,6 +582,13 @@ ipcMain.handle("desktop:list-adb-devices", async () => adbDevices());
 ipcMain.handle("desktop:select-output-directory", async () => {
   const result = await dialog.showOpenDialog(mainWindow!, { properties: ["openDirectory", "createDirectory"], title: "Select analysis output directory" });
   return result.canceled ? undefined : result.filePaths[0];
+});
+ipcMain.handle("desktop:open-external", async (_event, value: string) => {
+  let url: URL;
+  try { url = new URL(String(value)); }
+  catch { throw new Error("Invalid external URL"); }
+  if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("Unsupported external URL protocol");
+  await shell.openExternal(url.toString());
 });
 ipcMain.handle("desktop:import-attachments", async (_event, caseId: string, workId?: string) => {
   if (!/^[a-zA-Z0-9._-]+$/.test(caseId) || caseId.includes("..")) throw new Error("Invalid case id");
@@ -567,7 +769,7 @@ ipcMain.handle("case:list-work-apks", async (_event, caseId: string, workId: str
   }
   return found.sort((a, b) => Date.parse(b.modifiedAt) - Date.parse(a.modifiedAt));
 });
-ipcMain.handle("work:build", async (_event, caseId: string, workId: string) => {
+ipcMain.handle("work:build", async (_event, caseId: string, workId: string, clean = false) => {
   if (!/^[a-zA-Z0-9._-]+$/.test(caseId) || caseId.includes("..")) throw new Error("Invalid case id");
   const caseDir = await findCaseDir(caseId);
   const state = JSON.parse(await readFile(path.join(caseDir, "state.json"), "utf8"));
@@ -576,14 +778,26 @@ ipcMain.handle("work:build", async (_event, caseId: string, workId: string) => {
   const cwd = await assertCaseWorkspacePath(path.resolve(work.run?.workspaceDir ?? work.run?.taskDir ?? caseDir));
   if (!(await stat(cwd)).isDirectory()) throw new Error("Work directory does not exist");
   try {
-    const invocation = await gradleBuildInvocation(cwd);
+    const rebuild = clean === true;
     const javaHome = await javaHomeForBuild();
     const encodingFlags = "-Dfile.encoding=UTF-8 -Dsun.stdout.encoding=UTF-8 -Dsun.stderr.encoding=UTF-8";
     const env = { ...process.env, ...(javaHome ? { JAVA_HOME: javaHome, Path: `${path.join(javaHome, "bin")}${path.delimiter}${process.env.Path ?? ""}`, PATH: `${path.join(javaHome, "bin")}${path.delimiter}${process.env.PATH ?? ""}` } : {}), JAVA_TOOL_OPTIONS: `${process.env.JAVA_TOOL_OPTIONS ?? ""} ${encodingFlags}`.trim(), GRADLE_OPTS: `${process.env.GRADLE_OPTS ?? ""} ${encodingFlags}`.trim() };
-    const { stdout, stderr } = await execFileAsync(invocation.executable, invocation.args, { cwd, env, encoding: "buffer", timeout: 30 * 60_000, maxBuffer: 50 * 1024 * 1024, windowsHide: true, windowsVerbatimArguments: invocation.windowsVerbatimArguments });
-    const output = `${decodeProcessText(stdout)}${stderr?.length ? `\n${decodeProcessText(stderr)}` : ""}`.trim();
-    return { success: true as const, message: `Build succeeded via ${invocation.source}`, output: output.slice(-8_000) };
-  } catch (error) { throw commandFailure("Build", error); }
+    if (rebuild) await closeIntegratedBuildTerminals(cwd);
+    const runGradle = async (tasks: string[]) => {
+      const invocation = await gradleBuildInvocation(cwd, tasks);
+      const { stdout, stderr } = await execFileAsync(invocation.executable, invocation.args, { cwd, env, encoding: "buffer", timeout: 30 * 60_000, maxBuffer: 50 * 1024 * 1024, windowsHide: true, windowsVerbatimArguments: invocation.windowsVerbatimArguments });
+      return { invocation, output: `${decodeProcessText(stdout)}${stderr?.length ? `\n${decodeProcessText(stderr)}` : ""}`.trim() };
+    };
+    try {
+      const result = await runGradle(gradleBuildTasks(rebuild));
+      return { success: true as const, message: `${rebuild ? "Rebuild" : "Build"} succeeded via ${result.invocation.source}`, output: result.output.slice(-8_000) };
+    } catch (error) {
+      if (!rebuild || !(await cleanRemovedAllFiles(error, cwd))) throw error;
+      const result = await runGradle(["--no-daemon", "assembleDebug"]);
+      const cleanNotice = "Gradle could not remove locked empty output directories, but all build files were cleared before the full build.";
+      return { success: true as const, message: `Rebuild succeeded via ${result.invocation.source}`, output: `${cleanNotice}\n${result.output}`.slice(-8_000) };
+    }
+  } catch (error) { throw commandFailure(clean === true ? "Rebuild" : "Build", error); }
 });
 ipcMain.handle("work:install-apk", async (_event, serial: string, apkPath: string) => {
   const device = (await adbDevices()).find(item => item.serial === serial && item.state === "device");
@@ -659,7 +873,12 @@ ipcMain.handle("desktop:identify-apk", async (_event, filename: string) => {
     await mkdir(path.join(caseDir, "evidence"), { recursive: true });
     await writeFile(path.join(caseDir, "state.json"), JSON.stringify(existing, null, 2) + "\n");
   }
-  if (ensureCaseInputModel(existing)) await writeFile(path.join(casesRoot, caseId, "state.json"), JSON.stringify(existing, null, 2) + "\n");
+  const existingCaseDir = path.join(casesRoot, caseId);
+  const worksChanged = migrateLegacyWorks(existing);
+  const inheritanceChanged = ensureLegacyWorkInheritance(existing);
+  const inputsChanged = ensureCaseInputModel(existing);
+  const artifactsChanged = await rebuildWorkArtifactOwnership(existing, existingCaseDir);
+  if (worksChanged || inheritanceChanged || inputsChanged || artifactsChanged) await writeFile(path.join(existingCaseDir, "state.json"), JSON.stringify(existing, null, 2) + "\n");
   return { caseId, existing: await withArtifactTypes(existing) };
 });
 ipcMain.handle("case:create", async (_event, request: CreateCaseRequest) => {
@@ -705,23 +924,46 @@ ipcMain.handle("case:open-input", async (_event, caseId: string, inputId: string
   const error = await shell.openPath(input.path);
   if (error) throw new Error(error);
 });
-ipcMain.handle("agent:initialize", async (_event, caseId?: string, force = false) => {
-  const key = caseId ?? "workspace";
-  if (!force && activeInitializationKey === key && worker && !worker.killed) return;
-  if (pendingInitialization) {
-    if (pendingInitialization.key !== key) throw new Error("Pi is initializing another case");
-    return new Promise<void>((resolve, reject) => { pendingInitialization!.resolves.push(resolve); pendingInitialization!.rejects.push(reject); });
+ipcMain.handle("case:reveal-input", async (_event, caseId: string, inputId: string) => {
+  if (!/^[a-zA-Z0-9._-]+$/.test(caseId) || caseId.includes("..")) throw new Error("Invalid case id");
+  const caseDir = await findCaseDir(caseId);
+  const state = JSON.parse(await readFile(path.join(caseDir, "state.json"), "utf8"));
+  ensureCaseInputModel(state);
+  const input = state.inputs.find((item: CaseInput) => item.id === inputId);
+  if (!input) throw new Error("Case input not found");
+  if (!input.path) throw new Error("This case input has no local path");
+  const resolved = path.resolve(input.path);
+  const info = await stat(resolved);
+  if (info.isDirectory()) {
+    const error = await shell.openPath(resolved);
+    if (error) throw new Error(error);
+  } else {
+    shell.showItemInFolder(resolved);
   }
+});
+ipcMain.handle("agent:initialize", async (_event, caseId?: string, workId?: string, force = false) => {
+  if (workId && (!/^[a-zA-Z0-9._-]+$/.test(workId) || workId.includes(".."))) throw new Error("Invalid work id");
+  if (workId && !caseId) throw new Error("A Work session requires a CASE id");
+  const runtime = createWorkerRuntime(caseId, workId);
+  if (!force && runtime.ready) {
+    for (const event of runtime.journal) emitWorkerEvent(runtime, event);
+    await emitPromptQueue(runtime);
+    return;
+  }
+  if (runtime.pendingInitialization) {
+    return new Promise<void>((resolve, reject) => { runtime.pendingInitialization!.resolves.push(resolve); runtime.pendingInitialization!.rejects.push(reject); });
+  }
+  if (force && runtime.streaming) throw new Error("Cannot rebuild a Pi session while its Work is running");
   const settings = await readSettings();
   const caseRoot = caseId ? path.dirname(await findCaseDir(caseId, settings)) : casesRootFor(settings);
   return new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => {
-      const pending = pendingInitialization;
-      pendingInitialization = undefined;
+      const pending = runtime.pendingInitialization;
+      runtime.pendingInitialization = undefined;
       for (const fail of pending?.rejects ?? [reject]) fail(new Error("Pi initialization timed out"));
     }, 60_000);
-    pendingInitialization = { key, resolves: [resolve], rejects: [reject], timer };
-    send({ type: "initialize", cwd: projectRoot, caseId, caseRoot, settings });
+    runtime.pendingInitialization = { resolves: [resolve], rejects: [reject], timer };
+    runtime.worker.send({ type: "initialize", cwd: projectRoot, caseId, workId, caseRoot, settings, invalidate: force } satisfies WorkerCommand);
   });
 });
 ipcMain.handle("settings:get", () => readSettings());
@@ -756,16 +998,81 @@ ipcMain.handle("mcp:check-readiness", async (_event, server: string) => {
   }
   throw new Error("Unknown MCP server");
 });
-ipcMain.handle("agent:prompt", (_event, text: string, images?: ImageAttachment[]) => send({ type: "prompt", text, images }));
-ipcMain.handle("agent:abort", () => send({ type: "abort" }));
+ipcMain.handle("agent:prompt", async (_event, caseId: string | undefined, workId: string | undefined, text: string, displayText: string, images?: ImageAttachment[]) => {
+  const runtime = createWorkerRuntime(caseId, workId);
+  if (!runtime.ready) throw new Error("Pi session is not initialized");
+  const now = new Date().toISOString();
+  const entry: StoredPromptQueueItem = { id: randomUUID(), caseId, workId, agentText: String(text), displayText: String(displayText).trim() || "Attachment request", images, imageCount: images?.length ?? 0, status: "queued", createdAt: now, updatedAt: now };
+  return serializeQueueOperation(runtime, async () => {
+    const queue = await ensurePromptQueue(runtime);
+    queue.push(entry);
+    runtime.paused = false;
+    await persistPromptQueue(runtime);
+    await dispatchNextPrompt(runtime);
+    await emitPromptQueue(runtime);
+    return promptQueueView(entry);
+  });
+});
+ipcMain.handle("agent:abort", async (_event, caseId?: string, workId?: string) => {
+  const runtime = agentRuntimes.get(sessionKey(caseId, workId));
+  if (!runtime) return;
+  await serializeQueueOperation(runtime, async () => {
+    runtime.paused = true;
+    if (runtime.currentPromptId) {
+      runtime.queue = (await ensurePromptQueue(runtime)).filter(item => item.id !== runtime.currentPromptId);
+      runtime.currentPromptId = undefined;
+      runtime.streaming = false;
+      await persistPromptQueue(runtime);
+      await emitPromptQueue(runtime);
+    }
+  });
+  runtime.worker.send({ type: "abort" } satisfies WorkerCommand);
+});
+ipcMain.handle("agent:queue-list", async (_event, caseId?: string, workId?: string) => {
+  const runtime = createWorkerRuntime(caseId, workId);
+  return serializeQueueOperation(runtime, () => emitPromptQueue(runtime));
+});
+ipcMain.handle("agent:queue-update", async (_event, caseId: string | undefined, workId: string | undefined, promptId: string, displayText: string) => {
+  const runtime = createWorkerRuntime(caseId, workId);
+  return serializeQueueOperation(runtime, async () => {
+    const queue = await ensurePromptQueue(runtime);
+    const index = queue.findIndex(item => item.id === promptId && item.status === "queued");
+    if (index < 0) throw new Error("Only queued messages can be edited");
+    queue[index] = replaceQueuedPromptDisplay(queue[index]!, displayText, new Date().toISOString());
+    await persistPromptQueue(runtime);
+    return emitPromptQueue(runtime);
+  });
+});
+ipcMain.handle("agent:queue-move", async (_event, caseId: string | undefined, workId: string | undefined, promptId: string, direction: "up" | "down") => {
+  const runtime = createWorkerRuntime(caseId, workId);
+  return serializeQueueOperation(runtime, async () => {
+    runtime.queue = moveQueuedPrompt(await ensurePromptQueue(runtime), promptId, direction);
+    await persistPromptQueue(runtime);
+    return emitPromptQueue(runtime);
+  });
+});
+ipcMain.handle("agent:queue-delete", async (_event, caseId: string | undefined, workId: string | undefined, promptId: string) => {
+  const runtime = createWorkerRuntime(caseId, workId);
+  return serializeQueueOperation(runtime, async () => {
+    const queue = await ensurePromptQueue(runtime);
+    const target = queue.find(item => item.id === promptId);
+    if (target?.status === "running") throw new Error("Stop the running task instead of deleting it from the queue");
+    runtime.queue = queue.filter(item => item.id !== promptId);
+    await persistPromptQueue(runtime);
+    return emitPromptQueue(runtime);
+  });
+});
 ipcMain.handle("case:read", async (_event, caseId: string) => {
   if (!/^[a-zA-Z0-9._-]+$/.test(caseId) || caseId.includes("..")) throw new Error("Invalid case id");
   try {
-    const stateFile = path.join(await findCaseDir(caseId), "state.json");
+    const caseDir = await findCaseDir(caseId);
+    const stateFile = path.join(caseDir, "state.json");
     const state = JSON.parse(await readFile(stateFile, "utf8"));
     const worksChanged = migrateLegacyWorks(state);
+    const inheritanceChanged = ensureLegacyWorkInheritance(state);
     const inputsChanged = ensureCaseInputModel(state);
-    const changed = worksChanged || inputsChanged;
+    const artifactsChanged = await rebuildWorkArtifactOwnership(state, caseDir);
+    const changed = worksChanged || inheritanceChanged || inputsChanged || artifactsChanged;
     if (changed) await writeFile(stateFile, JSON.stringify(state, null, 2) + "\n");
     return withArtifactTypes(state);
   }
@@ -774,7 +1081,7 @@ ipcMain.handle("case:read", async (_event, caseId: string) => {
 ipcMain.handle("case:list", async () => {
   const settings = await readSettings();
   const roots = [...new Set([casesRootFor(settings), legacyCasesRoot])];
-  const cases = new Map<string, { id: string; target?: string; sha256?: string; updatedAt: string; phase: string; analysisCategory?: AnalysisCategory; artifactCount: number; description?: string; title?: string; platform?: string; inputCount?: number }>();
+  const cases = new Map<string, CaseSummary>();
   for (const root of roots) {
     let entries;
     try { entries = await readdir(root, { withFileTypes: true }); }
@@ -784,7 +1091,7 @@ ipcMain.handle("case:list", async () => {
       try {
         const state = JSON.parse(await readFile(path.join(root, entry.name, "state.json"), "utf8"));
         ensureCaseInputModel(state);
-        const summary = { id: state.id ?? entry.name, title: state.title ?? state.id ?? entry.name, platform: state.platform, inputCount: state.inputs.length, target: state.target, sha256: state.sha256, updatedAt: state.updatedAt ?? state.createdAt, phase: state.phase ?? "INTAKE", analysisCategory: state.analysisCategory, artifactCount: Array.isArray(state.artifacts) ? state.artifacts.length : 0, description: state.description ?? state.analysisGoal };
+        const summary: CaseSummary = { id: state.id ?? entry.name, title: state.title ?? state.id ?? entry.name, platform: state.platform, inputCount: state.inputs.length, target: state.target, sha256: state.sha256, updatedAt: state.updatedAt ?? state.createdAt, phase: state.phase ?? "INTAKE", analysisCategory: state.analysisCategory, artifactCount: Array.isArray(state.artifacts) ? state.artifacts.length : 0, description: state.description ?? state.analysisGoal, works: orderedCaseWorkSummaries(state.works, { category: state.analysisCategory, createdAt: state.createdAt }) };
         const existing = cases.get(summary.id);
         if (!existing || Date.parse(summary.updatedAt) > Date.parse(existing.updatedAt)) cases.set(summary.id, summary);
       } catch { /* ignore directories that are not valid cases */ }
@@ -862,49 +1169,58 @@ function workDirectoryName(category: AnalysisCategory, goal: string, requestId: 
 
 ipcMain.handle("case:switch-work", async (_event, caseId: string, workId: string) => {
   if (!/^[a-zA-Z0-9._-]+$/.test(caseId) || caseId.includes("..")) throw new Error("Invalid case id");
-  const stateFile = path.join(await findCaseDir(caseId), "state.json");
-  const state = JSON.parse(await readFile(stateFile, "utf8"));
-  const work = Array.isArray(state.works) ? state.works.find((item: { id?: string }) => item.id === workId) : undefined;
-  if (!work) throw new Error("Work item not found");
-  state.activeWorkId = work.id;
-  state.activeRun = structuredClone(work.run);
-  state.analysisGoal = work.goal;
-  state.analysisCategory = work.category;
-  state.updatedAt = new Date().toISOString();
-  await writeFile(stateFile, JSON.stringify(state, null, 2) + "\n");
+  const { state } = await mutateCaseState(caseId, state => {
+    const work = Array.isArray(state.works) ? state.works.find((item: { id?: string }) => item.id === workId) : undefined;
+    if (!work) throw new Error("Work item not found");
+    state.activeWorkId = work.id;
+    state.activeRun = structuredClone(work.run);
+    state.analysisGoal = work.goal;
+    state.analysisCategory = work.category;
+    state.updatedAt = new Date().toISOString();
+  });
   return withArtifactTypes(state);
 });
 
 ipcMain.handle("case:delete-work", async (_event, caseId: string, workId: string) => {
   if (!/^[a-zA-Z0-9._-]+$/.test(caseId) || caseId.includes("..")) throw new Error("Invalid case id");
-  const stateFile = path.join(await findCaseDir(caseId), "state.json");
-  const state = JSON.parse(await readFile(stateFile, "utf8"));
-  const works = Array.isArray(state.works) ? state.works : [];
-  if (!works.some((item: { id?: string }) => item.id === workId)) throw new Error("Work item not found");
-  state.works = works.filter((item: { id?: string }) => item.id !== workId);
-  if (state.activeWorkId === workId) {
-    const fallback = state.works.at(-1);
-    state.activeWorkId = fallback?.id;
-    state.activeRun = fallback ? structuredClone(fallback.run) : undefined;
-    state.analysisGoal = fallback?.goal ?? "";
-    state.analysisCategory = fallback?.category ?? "report";
-  }
-  state.updatedAt = new Date().toISOString();
-  await writeFile(stateFile, JSON.stringify(state, null, 2) + "\n");
+  const runtime = agentRuntimes.get(sessionKey(caseId, workId));
+  if (runtime?.streaming) throw new Error("Stop this Work before deleting it");
+  const { state } = await mutateCaseState(caseId, state => {
+    const works = Array.isArray(state.works) ? state.works : [];
+    if (!works.some((item: { id?: string }) => item.id === workId)) throw new Error("Work item not found");
+    state.works = works.filter((item: { id?: string }) => item.id !== workId);
+    if (state.activeWorkId === workId) {
+      const fallback = state.works.at(-1);
+      state.activeWorkId = fallback?.id;
+      state.activeRun = fallback ? structuredClone(fallback.run) : undefined;
+      state.analysisGoal = fallback?.goal ?? "";
+      state.analysisCategory = fallback?.category ?? "report";
+    }
+    state.updatedAt = new Date().toISOString();
+  });
   return withArtifactTypes(state);
 });
 ipcMain.handle("case:rename-work", async (_event, caseId: string, workId: string, rawTitle: string) => {
   if (!/^[a-zA-Z0-9._-]+$/.test(caseId) || caseId.includes("..")) throw new Error("Invalid case id");
   const title = String(rawTitle ?? "").trim();
   if (!title || title.length > 80) throw new Error("Work title must contain 1 to 80 characters");
-  const stateFile = path.join(await findCaseDir(caseId), "state.json");
-  const state = JSON.parse(await readFile(stateFile, "utf8"));
-  const work = Array.isArray(state.works) ? state.works.find((item: { id?: string }) => item.id === workId) : undefined;
-  if (!work) throw new Error("Work item not found");
-  work.title = title;
-  work.updatedAt = new Date().toISOString();
-  state.updatedAt = work.updatedAt;
-  await writeFile(stateFile, JSON.stringify(state, null, 2) + "\n");
+  const { state } = await mutateCaseState(caseId, state => {
+    const work = Array.isArray(state.works) ? state.works.find((item: { id?: string }) => item.id === workId) : undefined;
+    if (!work) throw new Error("Work item not found");
+    work.title = title;
+    work.updatedAt = new Date().toISOString();
+    state.updatedAt = work.updatedAt;
+  });
+  return withArtifactTypes(state);
+});
+ipcMain.handle("case:update-work", async (_event, caseId: string, workId: string, rawUpdate: { title?: string; category?: AnalysisCategory }) => {
+  if (!/^[a-zA-Z0-9._-]+$/.test(caseId) || caseId.includes("..")) throw new Error("Invalid case id");
+  const title = String(rawUpdate?.title ?? "").trim();
+  if (!title || title.length > 80) throw new Error("Work title must contain 1 to 80 characters");
+  const categories = new Set<AnalysisCategory>(["deobfuscation", "report", "parameter-trace", "algorithm-recovery", "data-collection", "runtime-diagnostics", "protocol-recovery", "version-diff", "app-reconstruction", "app-development"]);
+  const category = rawUpdate?.category;
+  if (!category || !categories.has(category)) throw new Error("Invalid analysis category");
+  const { state } = await mutateCaseState(caseId, state => applyWorkMetadataUpdate(state, workId, { title, category }, new Date().toISOString()));
   return withArtifactTypes(state);
 });
 ipcMain.handle("case:save-analysis-request", async (_event, caseId: string, rawGoal: string, category: AnalysisCategory) => {
@@ -915,6 +1231,7 @@ ipcMain.handle("case:save-analysis-request", async (_event, caseId: string, rawG
   const categories = new Set<AnalysisCategory>(["deobfuscation", "report", "parameter-trace", "algorithm-recovery", "data-collection", "runtime-diagnostics", "protocol-recovery", "version-diff", "app-reconstruction", "app-development"]);
   if (!categories.has(category)) throw new Error("Invalid analysis category");
   const caseDir = await findCaseDir(caseId);
+  return withCaseStateLock(caseDir, async () => {
   const stateFile = path.join(caseDir, "state.json");
   const state = JSON.parse(await readFile(stateFile, "utf8"));
   const sourceCategory = state.analysisCategory as AnalysisCategory | undefined;
@@ -970,6 +1287,7 @@ ipcMain.handle("case:save-analysis-request", async (_event, caseId: string, rawG
   for (const item of work.artifacts) if (!state.artifacts.includes(item)) state.artifacts.push(item);
   await writeFile(stateFile, JSON.stringify(state, null, 2) + "\n");
   return state;
+  });
 });
 async function assertCaseWorkspacePath(filename: string): Promise<string> {
   const resolved = path.resolve(filename);
@@ -1032,7 +1350,10 @@ app.whenReady().then(createWindow);
 app.on("window-all-closed", () => { if (process.platform !== "darwin") app.quit(); });
 app.on("activate", () => { if (BrowserWindow.getAllWindows().length === 0) void createWindow(); });
 app.on("before-quit", () => {
-  if (worker) send({ type: "shutdown" });
+  for (const runtime of agentRuntimes.values()) {
+    try { runtime.worker.send({ type: "shutdown" } satisfies WorkerCommand); } catch { /* already exited */ }
+  }
+  agentRuntimes.clear();
   for (const terminal of terminals.values()) {
     try { terminal.process.kill(); } catch { /* already exited */ }
   }

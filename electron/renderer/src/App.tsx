@@ -1,18 +1,27 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { Activity, BookOpen, Bot, Box, Braces, Bug, ChevronDown, ChevronRight, CircleStop, Copy, FileCode2, FolderOpen, Languages, Maximize2, Minimize2, Network, Paperclip, Pencil, Play, Radio, RefreshCw, ScrollText, Send, Settings, ShieldCheck, Smartphone, TerminalSquare, Trash2, UserRound, WrapText, X } from "lucide-react";
-import type { AdbDeviceInfo, AdbPackageInfo, AnalysisCategory, AppSettings, AttachedFileInfo, CaseInputDraft, CasePlatform, CaseStateView, CaseSummary, DirectoryEntryInfo, ImageAttachment, InstallableApk, SkillInfo, TerminalEvent, TerminalSessionInfo, WorkerEvent } from "../../shared.js";
+import { Activity, ArrowDown, ArrowUp, BookOpen, Bookmark, Bot, Box, Braces, Bug, ChevronDown, ChevronRight, CircleStop, Copy, Download, FileCode2, FolderOpen, Languages, Maximize2, Minimize2, Moon, Network, Paperclip, Pencil, Play, Radio, RefreshCw, ScrollText, Send, Settings, ShieldCheck, Smartphone, Sun, TerminalSquare, Trash2, UserRound, WrapText, X } from "lucide-react";
+import type { AdbDeviceInfo, AdbPackageInfo, AnalysisCategory, AppSettings, AttachedFileInfo, CaseInputDraft, CasePlatform, CaseStateView, CaseSummary, DirectoryEntryInfo, ImageAttachment, InstallableApk, PromptQueueItemView, RoutedWorkerEvent, SkillInfo, TerminalEvent, TerminalSessionInfo } from "../../shared.js";
 import { workTypes } from "./work-types.js";
 import { XtermView, type XtermHandle } from "./XtermView.js";
 import { clampAgentPanelWidth, DEFAULT_AGENT_PANEL_WIDTH } from "./layout.js";
+import { filterTerminalQuickCommands, parseTerminalQuickCommands, terminalCommandPayload, type TerminalQuickCommand, type TerminalQuickCommandFilter } from "./terminal-quick-commands.js";
+import { TERMINAL_CLEAR_INPUT } from "./terminal-display.js";
+import { historyImageAttachments, historyNeedsFinalResponse, parseVisibleUserHistoryMessage, visibleUserHistoryText, type HistoryMessageAttachment } from "./chat-history.js";
+import { canRestorePastedText, pastedTextPreview, shouldAttachPastedText } from "./paste-attachments.js";
+import { isChatNearBottom } from "./chat-scroll.js";
+import { MarkdownMessage } from "./MarkdownMessage.js";
+import { nextAppTheme, resolveAppTheme, THEME_STORAGE_KEY, type AppTheme } from "./theme.js";
 import "./report.css";
 
 type ToolDetail = { id?: string; title: string; body?: string; output?: string; status?: string; at: string };
 type ToolActionKind = "read" | "write" | "command";
-type TimelineItem = { id: string; kind: "assistant" | "user" | "tool" | "system" | "error"; title: string; body?: string; output?: string; toolDetails?: ToolDetail[]; images?: string[]; status?: string; at: string; expanded?: boolean };
+type TimelineItem = { id: string; kind: "assistant" | "user" | "tool" | "system" | "error"; title: string; body?: string; output?: string; toolDetails?: ToolDetail[]; attachments?: HistoryMessageAttachment[]; images?: string[]; imageNames?: string[]; status?: string; at: string; expanded?: boolean };
 type LogItem = { channel: string; message: string; at: string };
 type UsedSkill = { name: string; source: string; at: string };
-type PastedTextAttachment = { id: string; name: string; text: string; expanded: boolean };
+type PastedTextAttachment = { id: string; name: string; text: string };
+type ImagePreview = { source: string; name: string };
+type TextPreview = { content: string; name: string };
 type CaseSourceKind = "blank" | "apk" | "device" | "project" | "materials";
 type TerminalTab = TerminalSessionInfo & { status: "running" | "exited" | "failed" };
 
@@ -108,6 +117,16 @@ const categoryCopy: Record<Locale, Record<AnalysisCategory, { label: string; des
   },
 };
 
+function CaseWorkTags({ summary, locale }: { summary: CaseSummary; locale: Locale }) {
+  const works = summary.works?.length
+    ? summary.works
+    : summary.analysisCategory
+      ? [{ id: "legacy-work", title: "", category: summary.analysisCategory, createdAt: summary.updatedAt }]
+      : [];
+  if (!works.length) return <div className="case-work-tags"><i><span>{summary.phase}</span></i></div>;
+  return <div className="case-work-tags" aria-label={locale === "zh-CN" ? "工作顺序" : "Work order"}>{works.map((work, index) => <i title={work.title || categoryCopy[locale][work.category].label} key={`${work.id}-${index}`}><span>{categoryCopy[locale][work.category].label}</span>{index < works.length - 1 && <ChevronRight size={11}/>}</i>)}</div>;
+}
+
 type CategorySection = "analysis" | "tools" | "development";
 const categorySections: Array<{ id: CategorySection; zh: string; en: string; descriptionZh: string; descriptionEn: string; categories: AnalysisCategory[] }> = [
   { id: "analysis", zh: "分析", en: "Analysis", descriptionZh: "分析代码与协议、追踪参数并还原实现", descriptionEn: "Analyze code and protocols, trace parameters, and recover implementations", categories: ["deobfuscation", "report", "parameter-trace", "algorithm-recovery", "protocol-recovery"] },
@@ -145,6 +164,7 @@ const categoryDirectives: Record<AnalysisCategory, string> = {
 };
 
 function stamp(): string { return new Date().toLocaleTimeString("zh-CN", { hour12: false }); }
+function agentSessionKey(caseId?: string, workId?: string): string { return caseId ? `${caseId}:${workId ?? "case"}` : "workspace"; }
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer);
   let binary = "";
@@ -250,9 +270,9 @@ function historyToTimeline(messages: unknown[]): TimelineItem[] {
     const message = raw as { role?: string; content?: unknown; toolCallId?: string; toolName?: string; isError?: boolean; timestamp?: number };
     const at = message.timestamp ? new Date(message.timestamp).toLocaleTimeString("zh-CN", { hour12: false }) : "";
     if (message.role === "user") {
-      const text = messageText(message.content).trim();
-      const images = Array.isArray(message.content) ? (message.content as Array<Record<string, unknown>>).filter(block => block.type === "image" && block.data).map(block => `data:${String(block.mimeType)};base64,${String(block.data)}`) : [];
-      if ((text || images.length) && !text.startsWith("/reverse-case-") && !text.startsWith("You are starting a goal-driven") && !text.startsWith("[SEAGULL_FINAL_RESPONSE_RECOVERY]")) items.push({ id: `user-${message.timestamp ?? crypto.randomUUID()}-${items.length}`, kind: "user", title: "你", body: text, images, at });
+      const visible = parseVisibleUserHistoryMessage(messageText(message.content));
+      const images = historyImageAttachments(message.content).map(image => image.source);
+      if (visible || images.length) items.push({ id: `user-${message.timestamp ?? crypto.randomUUID()}-${items.length}`, kind: "user", title: "你", body: visible?.text, attachments: visible?.attachments, images, imageNames: visible?.imageNames, at });
     }
     if (message.role === "assistant" && Array.isArray(message.content)) {
       for (const block of message.content as Array<Record<string, unknown>>) {
@@ -268,18 +288,6 @@ function historyToTimeline(messages: unknown[]): TimelineItem[] {
     }
   }
   return collapseCompletedTools(items);
-}
-
-function historyNeedsFinalResponse(messages: unknown[]): boolean {
-  let sawUser = false;
-  let finalTextAfterUser = false;
-  for (const raw of messages) {
-    const message = raw as { role?: string; content?: unknown };
-    if (message.role === "user") { sawUser = true; finalTextAfterUser = false; continue; }
-    if (!sawUser || message.role !== "assistant" || !Array.isArray(message.content)) continue;
-    if ((message.content as Array<Record<string, unknown>>).some(block => block.type === "text" && String(block.text ?? "").trim())) finalTextAfterUser = true;
-  }
-  return sawUser && !finalTextAfterUser;
 }
 
 function toolChannel(name: string): string {
@@ -332,6 +340,7 @@ function skillsFromTimeline(items: TimelineItem[]): UsedSkill[] {
 
 export function App() {
   const [locale, setLocale] = useState<Locale>(() => (localStorage.getItem("seagull.locale") as Locale) || "zh-CN");
+  const [theme, setTheme] = useState<AppTheme>(() => resolveAppTheme(localStorage.getItem(THEME_STORAGE_KEY)));
   const t = copy[locale];
   const analysisText = analysisCopy[locale];
   const phaseText = phaseCopy[locale];
@@ -355,6 +364,7 @@ export function App() {
   const [caseWizardError, setCaseWizardError] = useState("");
   const [ready, setReady] = useState(false);
   const [initializing, setInitializing] = useState(true);
+  const [switchingWorkId, setSwitchingWorkId] = useState<string>();
   const [streaming, setStreaming] = useState(false);
   const [model, setModel] = useState<string>(t.modelNone);
   const [tools, setTools] = useState<string[]>([]);
@@ -362,6 +372,7 @@ export function App() {
   const [mcpReadiness, setMcpReadiness] = useState<Record<string, { ready: boolean; detail: string }>>({});
   const [active, setActive] = useState("Overview");
   const [timeline, setTimeline] = useState<TimelineItem[]>([]);
+  const [showTimelineBottomButton, setShowTimelineBottomButton] = useState(false);
   const [skillsOpen, setSkillsOpen] = useState(false);
   const usedSkills = useMemo(() => skillsFromTimeline(timeline), [timeline]);
   const [skillManagerOpen, setSkillManagerOpen] = useState(false);
@@ -377,6 +388,16 @@ export function App() {
   const [pendingImages, setPendingImages] = useState<ImageAttachment[]>([]);
   const [pendingFiles, setPendingFiles] = useState<AttachedFileInfo[]>([]);
   const [pastedTexts, setPastedTexts] = useState<PastedTextAttachment[]>([]);
+  const [promptQueue, setPromptQueue] = useState<PromptQueueItemView[]>([]);
+  const [queueExpanded, setQueueExpanded] = useState(true);
+  const [queueEditor, setQueueEditor] = useState<PromptQueueItemView>();
+  const [queueEditorText, setQueueEditorText] = useState("");
+  const [queueError, setQueueError] = useState("");
+  const [sessionActivity, setSessionActivity] = useState<Record<string, { streaming: boolean; queued: number }>>({});
+  const [imagePreview, setImagePreview] = useState<ImagePreview>();
+  const [imageActionStatus, setImageActionStatus] = useState("");
+  const [textPreview, setTextPreview] = useState<TextPreview>();
+  const [textActionStatus, setTextActionStatus] = useState("");
   const [agentExpanded, setAgentExpanded] = useState(false);
   const [agentResizing, setAgentResizing] = useState(false);
   const [agentWidth, setAgentWidth] = useState(() => clampAgentPanelWidth(Number(localStorage.getItem("seagull.agentWidth")) || DEFAULT_AGENT_PANEL_WIDTH, window.innerWidth));
@@ -393,9 +414,14 @@ export function App() {
   const [appMenuOpen, setAppMenuOpen] = useState(false);
   const [activityExpanded, setActivityExpanded] = useState(false);
   const [workQuery, setWorkQuery] = useState("");
+  const [workEditorId, setWorkEditorId] = useState<string>();
+  const [workEditorTitle, setWorkEditorTitle] = useState("");
+  const [workEditorCategory, setWorkEditorCategory] = useState<AnalysisCategory>("report");
+  const [workEditorError, setWorkEditorError] = useState("");
+  const [workEditorBusy, setWorkEditorBusy] = useState(false);
   const [terminalTabs, setTerminalTabs] = useState<TerminalTab[]>([]);
   const [activeTerminalId, setActiveTerminalId] = useState<string>();
-  const [workActionBusy, setWorkActionBusy] = useState<"build" | "install">();
+  const [workActionBusy, setWorkActionBusy] = useState<"build" | "rebuild" | "install">();
   const [workActionFeedback, setWorkActionFeedback] = useState<{ kind: "success" | "error"; message: string }>();
   const [installOpen, setInstallOpen] = useState(false);
   const [installLoading, setInstallLoading] = useState(false);
@@ -413,14 +439,21 @@ export function App() {
   const terminalBody = useRef<HTMLDivElement>(null);
   const terminalViews = useRef(new Map<string, XtermHandle>());
   const terminalPending = useRef(new Map<string, string>());
+  const terminalClosing = useRef(new Set<string>());
   const timelineBody = useRef<HTMLDivElement>(null);
+  const timelinePinnedToBottom = useRef(true);
   const imageInput = useRef<HTMLInputElement>(null);
+  const composerInput = useRef<HTMLTextAreaElement>(null);
   const appMenu = useRef<HTMLDivElement>(null);
   const activeAssistantId = useRef<string | undefined>(undefined);
+  const activePromptId = useRef<string | undefined>(undefined);
+  const queuedTimelineItems = useRef(new Map<string, TimelineItem>());
   const turnHadAssistantText = useRef(false);
   const finalRecoveryAttempted = useRef(false);
   const turnEnded = useRef(true);
   const startGeneration = useRef(0);
+  const activeSessionKey = useRef("workspace");
+  const activeSessionIdentity = useRef<{ caseId?: string; workId?: string }>({});
   const nav = [["Overview", locale === "zh-CN" ? "工作概览" : "Overview", ShieldCheck], ["Artifacts", locale === "zh-CN" ? "产物" : "Artifacts", ScrollText], ["Terminal", locale === "zh-CN" ? "终端" : "Terminal", TerminalSquare]] as const;
 
   function selectWorkspaceView(view: string) {
@@ -464,8 +497,19 @@ export function App() {
   }
 
   function toggleLocale() { const next: Locale = locale === "zh-CN" ? "en-US" : "zh-CN"; localStorage.setItem("seagull.locale", next); setLocale(next); document.documentElement.lang = next; }
+  function toggleTheme() { const next = nextAppTheme(theme); localStorage.setItem(THEME_STORAGE_KEY, next); document.documentElement.dataset.theme = next; setTheme(next); }
   useEffect(() => { setAnalysisSection(sectionForCategory(analysisCategory)); }, [analysisCategory]);
   useEffect(() => { if (active !== "Overview" && active !== "Artifacts" && active !== "Terminal") setActive("Overview"); }, [active]);
+  useEffect(() => {
+    if (!imagePreview && !textPreview) return;
+    setImageActionStatus("");
+    setTextActionStatus("");
+    const closePreview = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { setImagePreview(undefined); setTextPreview(undefined); }
+    };
+    document.addEventListener("keydown", closePreview);
+    return () => document.removeEventListener("keydown", closePreview);
+  }, [imagePreview, textPreview]);
   useEffect(() => {
     if (!appMenuOpen) return;
     const closeOutside = (event: PointerEvent) => { if (!appMenu.current?.contains(event.target as Node)) setAppMenuOpen(false); };
@@ -476,14 +520,40 @@ export function App() {
   }, [appMenuOpen]);
   function requestFinalRecovery(prompt: string) {
     turnEnded.current = false; setStreaming(true);
-    void window.mobileReverse.prompt(prompt).catch(() => { turnEnded.current = true; setStreaming(false); });
+    const identity = activeSessionIdentity.current;
+    void window.mobileReverse.prompt(identity.caseId, identity.workId, prompt, locale === "zh-CN" ? "补全上一轮最终答复" : "Recover the previous final response").catch(() => { turnEnded.current = true; setStreaming(false); });
   }
 
   useEffect(() => {
     window.scrollTo(0, 0);
     const lastApk = localStorage.getItem("seagull.lastApk");
     const lastCase = localStorage.getItem("seagull.lastCase");
-    const unsubscribe = window.mobileReverse.onWorkerEvent((message: WorkerEvent) => {
+    const unsubscribe = window.mobileReverse.onWorkerEvent((message: RoutedWorkerEvent) => {
+    if (message.sessionKey) {
+      if (message.type === "state") setSessionActivity(current => ({ ...current, [message.sessionKey!]: { streaming: message.streaming, queued: current[message.sessionKey!]?.queued ?? 0 } }));
+      if (message.type === "queue") setSessionActivity(current => ({ ...current, [message.sessionKey!]: { streaming: message.items.some(item => item.status === "running"), queued: message.items.filter(item => item.status === "queued").length } }));
+      if (message.sessionKey !== activeSessionKey.current) return;
+    }
+    if (message.type === "queue") {
+      const running = message.items.find(item => item.status === "running");
+      if (running?.id !== activePromptId.current) {
+        activePromptId.current = running?.id;
+        activeAssistantId.current = undefined;
+        turnHadAssistantText.current = false;
+        finalRecoveryAttempted.current = false;
+        turnEnded.current = !running;
+      }
+      if (running) setTimeline(items => {
+        const id = `queue-user-${running.id}`;
+        if (items.some(item => item.id === id)) return items.map(item => item.id === id ? { ...item, body: running.displayText, status: "sent" } : item);
+        const cached = queuedTimelineItems.current.get(running.id);
+        queuedTimelineItems.current.delete(running.id);
+        return [...items, cached ? { ...cached, body: running.displayText, status: "sent" } : { id, kind: "user", title: locale === "zh-CN" ? "你" : "You", body: running.displayText, status: "sent", at: new Date(running.createdAt).toLocaleTimeString(locale, { hour12: false }) }];
+      });
+      setPromptQueue(message.items);
+      setStreaming(Boolean(running));
+      return;
+    }
     if (message.type === "ready") { setReady(true); setInitializing(false); setTools(message.tools); if (message.history?.length) { setTimeline(historyToTimeline(message.history)); setLogs([...historyToLogs(message.history), { channel: "system", message: `Pi ready · ${message.sessionId}`, at: stamp() }]); if (historyNeedsFinalResponse(message.history) && !finalRecoveryAttempted.current) { finalRecoveryAttempted.current = true; window.setTimeout(() => requestFinalRecovery("[SEAGULL_FINAL_RESPONSE_RECOVERY] The previous turn ended after a tool result without a final user-facing answer. Do not repeat completed tool work. Review the immediately preceding request and tool results, then provide the complete final answer now."), 250); } } else setLogs(v => [...v, { channel: "system", message: `Pi ready · ${message.sessionId}`, at: stamp() }]); }
     if (message.type === "tools") setTools(message.tools);
     if (message.type === "state") { if (!message.streaming || !turnEnded.current) setStreaming(message.streaming); if (message.model) setModel(message.model); }
@@ -548,25 +618,29 @@ export function App() {
     }
     });
     void (async () => {
-      const saved = await window.mobileReverse.getSettings();
+      const settingsTask = window.mobileReverse.getSettings();
+      const storedCaseTask: Promise<CaseStateView | undefined> = lastCase
+        ? window.mobileReverse.readCase(lastCase).catch(() => { localStorage.removeItem("seagull.lastCase"); return undefined; })
+        : Promise.resolve(undefined);
+      const [saved, stored] = await Promise.all([settingsTask, storedCaseTask]);
       setSettings(saved);
       setModel(saved.modelId ? `seagull/${saved.modelId}` : t.modelNone);
       if (!saved.outputRoot.trim()) { setOutputError(true); setOutputOpen(true); }
       let bootCaseId: string | undefined;
-      if (lastCase) {
-        try {
-          const stored = await window.mobileReverse.readCase(lastCase);
-          if (stored) {
-            bootCaseId = stored.id;
-            setCaseId(stored.id); setCaseState(stored); setApk(stored.target);
-            setAnalysisGoal(stored.analysisGoal ?? ""); setAnalysisCategory(stored.analysisCategory ?? "report");
-          } else localStorage.removeItem("seagull.lastCase");
-        } catch { localStorage.removeItem("seagull.lastCase"); }
+      let bootWorkId: string | undefined;
+      if (stored) {
+        bootCaseId = stored.id;
+        bootWorkId = stored.activeWorkId;
+        setCaseId(stored.id); setCaseState(stored); setApk(stored.target);
+        setAnalysisGoal(stored.analysisGoal ?? ""); setAnalysisCategory(stored.analysisCategory ?? "report");
+      } else if (lastCase) {
+        localStorage.removeItem("seagull.lastCase");
       }
       if (!bootCaseId && lastApk) {
         try {
           const identified = await window.mobileReverse.identifyApk(lastApk);
           bootCaseId = identified.caseId;
+          bootWorkId = identified.existing?.activeWorkId;
           setApk(lastApk);
           setCaseId(identified.caseId);
           setCaseState(identified.existing);
@@ -575,13 +649,17 @@ export function App() {
           localStorage.setItem("seagull.lastCase", identified.caseId);
         } catch { localStorage.removeItem("seagull.lastApk"); }
       }
-      try { await initializeAgent(bootCaseId); }
+      try { await initializeAgent(bootCaseId, bootWorkId); }
       catch (error) { setLogs(v => [...v, { channel: "error", message: `MCP initialization failed: ${error instanceof Error ? error.message : String(error)}`, at: stamp() }]); }
     })();
     return unsubscribe;
   }, []);
 
   useEffect(() => window.mobileReverse.onTerminalEvent((event: TerminalEvent) => {
+    if (terminalClosing.current.has(event.terminalId)) {
+      if (event.type === "exit") terminalClosing.current.delete(event.terminalId);
+      return;
+    }
     const write = (data: string) => {
       const view = terminalViews.current.get(event.terminalId);
       if (view) view.write(data);
@@ -589,7 +667,10 @@ export function App() {
     };
     if (event.type === "output") write(event.data);
     else if (event.type === "error") write(`\r\n\x1b[31mERROR: ${event.message}\x1b[0m\r\n`);
-    else write(`\r\n\x1b[90m[Process exited with code ${event.code ?? "?"}]\x1b[0m\r\n`);
+    else {
+      removeTerminalSession(event.terminalId);
+      return;
+    }
     setTerminalTabs(current => {
       const index = current.findIndex(tab => tab.id === event.terminalId);
       if (event.type === "output") {
@@ -597,10 +678,10 @@ export function App() {
         return current;
       }
       if (event.type === "error") {
-        if (index < 0) return [...current, { id: event.terminalId, title: "PowerShell", cwd: "", status: "failed" }];
+        if (index < 0) return current;
         return current.map((tab, itemIndex) => itemIndex === index ? { ...tab, status: "failed" } : tab);
       }
-      return current.map((tab, itemIndex) => itemIndex === index ? { ...tab, status: "exited" } : tab);
+      return current;
     });
   }), []);
 
@@ -630,9 +711,24 @@ export function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
   useEffect(() => {
+    if (!timelinePinnedToBottom.current) return;
+    const frame = window.requestAnimationFrame(() => {
+      const element = timelineBody.current;
+      if (element) element.scrollTop = element.scrollHeight;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [timeline]);
+  useEffect(() => {
     const element = timelineBody.current;
-    if (element) element.scrollTop = element.scrollHeight;
-  }, [timeline.length]);
+    if (!element) return;
+    const onScroll = () => {
+      const pinned = isChatNearBottom(element);
+      timelinePinnedToBottom.current = pinned;
+      setShowTimelineBottomButton(!pinned);
+    };
+    element.addEventListener("scroll", onScroll, { passive: true });
+    return () => element.removeEventListener("scroll", onScroll);
+  }, []);
   const legacyPhaseIndex = Math.max(0, phases.indexOf(caseState?.phase ?? "INTAKE"));
   const runStages = useMemo(() => caseState?.activeRun?.stages ?? phases.map((id, index) => ({ id, label: phaseText[id] ?? id, status: index < legacyPhaseIndex ? "completed" as const : index === legacyPhaseIndex ? "running" as const : "pending" as const })), [caseState?.activeRun?.stages, legacyPhaseIndex, phaseText]);
   const completedStages = runStages.filter(stage => stage.status === "completed" || stage.status === "skipped").length;
@@ -657,9 +753,10 @@ export function App() {
   }, [caseState, locale]);
   const activeWork = works.find(work => work.id === caseState?.activeWorkId) ?? works[0];
   const activeWorkDirectory = activeWork?.run.workspaceDir ?? activeWork?.run.taskDir ?? caseState?.workspaceDir;
+  const activeWorkArtifacts = activeWork?.artifacts ?? [];
   const activeTerminal = terminalTabs.find(tab => tab.id === activeTerminalId) ?? terminalTabs[0];
   const visibleWorks = useMemo(() => { const query = workQuery.trim().toLowerCase(); return query ? works.filter(work => `${work.title} ${work.goal} ${categoryCopy[locale][work.category].label}`.toLowerCase().includes(query)) : works; }, [works, workQuery, locale]);
-  const reportArtifact = useMemo(() => caseState?.artifacts.find(file => /(?:^|[\\/])(?:final-)?report\.md$/i.test(file)), [caseState?.artifacts]);
+  const reportArtifact = useMemo(() => activeWorkArtifacts.find(file => /(?:^|[\\/])(?:final-)?report\.md$/i.test(file)) ?? activeWorkArtifacts.find(file => /(?:^|[\\/])delivery\.md$/i.test(file)), [activeWorkArtifacts]);
   const activeTool = useMemo(() => [...timeline].reverse().find(item => item.kind === "tool" && item.status === "running"), [timeline]);
   const statusActivity = streaming ? `${currentStageLabel}${activeTool ? ` · ${activeTool.title}` : ""}` : (locale === "zh-CN" ? "当前空闲" : "Idle");
   useEffect(() => { const latest = logs.at(-1); if (latest?.channel === "error") { setLogTab("problems"); setActivityExpanded(true); } }, [logs.length]);
@@ -669,20 +766,31 @@ export function App() {
     void openArtifact(reportArtifact);
   }, [active, reportArtifact]);
 
-  async function restoreApk(file: string): Promise<string | undefined> {
+  async function restoreApk(file: string): Promise<{ caseId: string; workId?: string } | undefined> {
     try {
       const identified = await window.mobileReverse.identifyApk(file);
       setApk(file); setCaseId(identified.caseId); setCaseState(identified.existing); setAnalysisGoal(identified.existing?.analysisGoal ?? ""); setAnalysisCategory(identified.existing?.analysisCategory ?? "report");
       localStorage.setItem("seagull.lastCase", identified.caseId);
-      return identified.caseId;
+      return { caseId: identified.caseId, workId: identified.existing?.activeWorkId };
     } catch { localStorage.removeItem("seagull.lastApk"); return undefined; }
   }
-  async function initializeAgent(selectedCaseId?: string, force = false) {
+  async function initializeAgent(selectedCaseId?: string, selectedWorkId?: string, force = false) {
+    activeSessionKey.current = agentSessionKey(selectedCaseId, selectedWorkId);
+    activeSessionIdentity.current = { caseId: selectedCaseId, workId: selectedWorkId };
+    timelinePinnedToBottom.current = true;
+    setShowTimelineBottomButton(false);
     setInitializing(true);
-    try { await window.mobileReverse.initialize(selectedCaseId, force); }
+    try { await window.mobileReverse.initialize(selectedCaseId, selectedWorkId, force); }
     finally { setInitializing(false); }
   }
-  async function chooseApk() { const file = await window.mobileReverse.selectApk(); if (file) { localStorage.setItem("seagull.lastApk", file); setReady(false); setTimeline([]); const selectedCaseId = await restoreApk(file); if (selectedCaseId) await initializeAgent(selectedCaseId); } }
+  function scrollTimelineToBottom() {
+    const element = timelineBody.current;
+    if (!element) return;
+    timelinePinnedToBottom.current = true;
+    setShowTimelineBottomButton(false);
+    element.scrollTo({ top: element.scrollHeight, behavior: "auto" });
+  }
+  async function chooseApk() { const file = await window.mobileReverse.selectApk(); if (file) { localStorage.setItem("seagull.lastApk", file); setReady(false); setTimeline([]); const selected = await restoreApk(file); if (selected) await initializeAgent(selected.caseId, selected.workId); } }
   function openCaseWizard(mode: "create" | "add" = caseId ? "add" : "create") {
     setCaseWizardMode(mode); setCaseSource("blank"); setCaseTitle(""); setCaseDescription(""); setCasePlatform("android"); setCaseSourcePaths([]); setAdbPackages([]); setSelectedAdbPackage(""); setCaseWizardError(""); setCaseWizardOpen(true);
   }
@@ -721,7 +829,7 @@ export function App() {
       localStorage.setItem("seagull.lastCase", saved.id);
       const apkInput = saved.inputs?.find(item => item.type === "apk")?.path;
       if (apkInput) localStorage.setItem("seagull.lastApk", apkInput); else localStorage.removeItem("seagull.lastApk");
-      await initializeAgent(saved.id, true);
+      await initializeAgent(saved.id, saved.activeWorkId, true);
     } catch (error) { setCaseWizardError(error instanceof Error ? error.message : String(error)); }
     finally { setCaseWizardBusy(false); }
   }
@@ -732,21 +840,22 @@ export function App() {
     finally { setCasesLoading(false); }
   }
   async function selectCase(id: string) {
-    setCasesOpen(false); setReady(false); setTimeline([]); setLogs([]); setSelectedArtifact(undefined); setArtifactText("");
+    setCasesOpen(false); setReady(false); setStreaming(false); setPromptQueue([]); setQueueEditor(undefined); setTimeline([]); setLogs([]); setSelectedArtifact(undefined); setArtifactText("");
     try {
       const stored = await window.mobileReverse.readCase(id);
       if (!stored) throw new Error(locale === "zh-CN" ? "案例不存在或已被移动。" : "The case no longer exists or was moved.");
       setCaseId(stored.id); setCaseState(stored); setApk(stored.target);
       setAnalysisGoal(stored.analysisGoal ?? ""); setAnalysisCategory(stored.analysisCategory ?? "report");
       localStorage.setItem("seagull.lastCase", stored.id);
-      await initializeAgent(stored.id);
+      await initializeAgent(stored.id, stored.activeWorkId);
     } catch (error) {
       setLogs(items => [...items, { channel: "error", message: error instanceof Error ? error.message : String(error), at: stamp() }]);
       setReady(true);
     }
   }
   async function deleteCase(id: string) {
-    if (id === caseId && streaming) { setCaseListError(locale === "zh-CN" ? "当前案例正在执行，停止工作后才能删除。" : "Stop the active work before deleting this case."); return; }
+    const caseBusy = Object.entries(sessionActivity).some(([key, activity]) => key.startsWith(`${id}:`) && activity.streaming);
+    if (caseBusy) { setCaseListError(locale === "zh-CN" ? "该案例仍有工作正在执行，停止对应工作后才能删除。" : "A Work in this case is still running. Stop it before deleting the case."); return; }
     setCaseListError("");
     try {
       const deleted = await window.mobileReverse.deleteCase(id);
@@ -755,7 +864,7 @@ export function App() {
       if (id === caseId) {
         setCaseId(undefined); setCaseState(undefined); setApk(undefined); setTimeline([]); setLogs([]); setSelectedArtifact(undefined); setArtifactText("");
         localStorage.removeItem("seagull.lastCase"); localStorage.removeItem("seagull.lastApk");
-        setReady(false); await initializeAgent(undefined, true);
+        setReady(false); await initializeAgent(undefined, undefined, true);
       }
     } catch (error) { setCaseListError(error instanceof Error ? error.message : String(error)); }
   }
@@ -779,27 +888,50 @@ export function App() {
     } catch (error) { setAnalysisError(error instanceof Error ? error.message : String(error)); }
   }
   async function switchWork(workId: string) {
-    if (!caseId || workId === caseState?.activeWorkId || streaming) return;
+    if (!caseId || workId === caseState?.activeWorkId) return;
+    setSwitchingWorkId(workId);
     try {
+      setReady(false); setStreaming(false); setPromptQueue([]); setQueueEditor(undefined); setTimeline([]); setLogs([]); setSkillsOpen(false);
+      activeAssistantId.current = undefined; turnHadAssistantText.current = false; finalRecoveryAttempted.current = false; turnEnded.current = true;
       const saved = await window.mobileReverse.switchWork(caseId, workId);
       setCaseState(saved); setAnalysisGoal(saved.analysisGoal ?? ""); setAnalysisCategory(saved.analysisCategory ?? "report");
       setSelectedArtifact(undefined); setArtifactText("");
-    } catch (error) { setLogs(items => [...items.slice(-400), { channel: "error", message: error instanceof Error ? error.message : String(error), at: stamp() }]); }
+      await initializeAgent(caseId, workId, false);
+    } catch (error) {
+      setReady(true);
+      setLogs(items => [...items.slice(-400), { channel: "error", message: error instanceof Error ? error.message : String(error), at: stamp() }]);
+    } finally { setSwitchingWorkId(undefined); }
   }
   async function deleteWork(workId: string) {
-    if (!caseId || streaming) return;
+    if (!caseId || sessionActivity[agentSessionKey(caseId, workId)]?.streaming) return;
     if (!window.confirm(locale === "zh-CN" ? "删除这条工作记录？工作目录和产物不会自动删除。" : "Delete this work record? Its directory and artifacts will remain.")) return;
-    try { const saved = await window.mobileReverse.deleteWork(caseId, workId); setCaseState(saved); }
+    const deletingActiveWork = workId === caseState?.activeWorkId;
+    try {
+      const saved = await window.mobileReverse.deleteWork(caseId, workId); setCaseState(saved);
+      if (deletingActiveWork) {
+        setReady(false); setTimeline([]); setLogs([]); setTools([]);
+        await initializeAgent(caseId, saved.activeWorkId, true);
+      }
+    }
     catch (error) { setLogs(items => [...items.slice(-400), { channel: "error", message: error instanceof Error ? error.message : String(error), at: stamp() }]); }
   }
-  async function renameWork(workId: string) {
-    if (!caseId || streaming) return;
+  function editWork(workId: string) {
+    if (!caseId) return;
     const work = works.find(item => item.id === workId);
     if (!work) return;
-    const title = window.prompt(locale === "zh-CN" ? "工作名称（最多 80 个字符）" : "Work title (up to 80 characters)", work.title);
-    if (title === null || !title.trim()) return;
-    try { setCaseState(await window.mobileReverse.renameWork(caseId, workId, title)); }
-    catch (error) { setLogs(items => [...items.slice(-400), { channel: "error", message: error instanceof Error ? error.message : String(error), at: stamp() }]); }
+    setWorkEditorId(workId); setWorkEditorTitle(work.title); setWorkEditorCategory(work.category); setWorkEditorError("");
+  }
+  async function saveWorkEditor() {
+    if (!caseId || !workEditorId || workEditorBusy) return;
+    const title = workEditorTitle.trim();
+    if (!title) { setWorkEditorError(locale === "zh-CN" ? "请输入工作名称。" : "Enter a Work title."); return; }
+    setWorkEditorBusy(true); setWorkEditorError("");
+    try {
+      if (typeof window.mobileReverse.updateWork !== "function") throw new Error(analysisText.preloadMismatch);
+      const saved = await window.mobileReverse.updateWork(caseId, workEditorId, { title, category: workEditorCategory });
+      setCaseState(saved); setAnalysisCategory(saved.analysisCategory ?? "report"); setWorkEditorId(undefined);
+    } catch (error) { setWorkEditorError(error instanceof Error ? error.message : String(error)); }
+    finally { setWorkEditorBusy(false); }
   }
   function branchWork(workId: string) {
     const work = works.find(item => item.id === workId);
@@ -807,25 +939,25 @@ export function App() {
     setAnalysisCategory(work.category); setAnalysisGoal(""); setAnalysisError(""); setAnalysisOpen(true);
   }
   async function rerunValidation(stage: { id: string; label: string; successCriteria?: string }) {
-    if (!caseId || !activeWork || streaming) return;
+    if (!caseId || !activeWork) return;
     const body = locale === "zh-CN" ? `重新验证：${stage.label}` : `Revalidate: ${stage.label}`;
     turnEnded.current = false; setStreaming(true);
     setTimeline(items => [...items, { id: crypto.randomUUID(), kind: "user", title: locale === "zh-CN" ? "复验请求" : "Validation request", body, status: "submitted", at: stamp() }]);
-    try { await window.mobileReverse.prompt(`[SEAGULL_VALIDATION_RERUN]\nContinue the current work '${activeWork.title}' without replanning or resetting its pipeline. Re-run only validation stage ${stage.id} (${stage.label}). Acceptance criterion: ${stage.successCriteria ?? "use the existing work plan and evidence"}. Reuse existing artifacts, run focused checks, register new evidence, update this stage, and report the exact result and remaining blocker.`); }
+    try { await window.mobileReverse.prompt(caseId, activeWork.id, `[SEAGULL_VALIDATION_RERUN]\nContinue the current work '${activeWork.title}' without replanning or resetting its pipeline. Re-run only validation stage ${stage.id} (${stage.label}). Acceptance criterion: ${stage.successCriteria ?? "use the existing work plan and evidence"}. Reuse existing artifacts, run focused checks, register new evidence, update this stage, and report the exact result and remaining blocker.`, body); }
     catch (error) { turnEnded.current = true; setStreaming(false); setLogs(items => [...items.slice(-400), { channel: "error", message: error instanceof Error ? error.message : String(error), at: stamp() }]); }
   }
   async function runWorkbenchAction(label: string, instruction: string) {
-    if (!activeWork || streaming) return;
+    if (!caseId || !activeWork) return;
     const body = locale === "zh-CN" ? `操作台：${label}` : `Workbench: ${label}`;
     turnEnded.current = false; setStreaming(true);
     setTimeline(items => [...items, { id: crypto.randomUUID(), kind: "user", title: body, body: instruction, status: "submitted", at: stamp() }]);
-    try { await window.mobileReverse.prompt(`[SEAGULL_WORKBENCH_ACTION]\nContinue the current Work '${activeWork.title}' without replanning or resetting its pipeline. Work only inside ${activeWork.run.taskDir ?? activeWork.run.workspaceDir}. Reuse upstream Work artifacts read-only. Execute this focused action: ${instruction}\nReport changed artifacts, validation result, and any blocker.`); }
+    try { await window.mobileReverse.prompt(caseId, activeWork.id, `[SEAGULL_WORKBENCH_ACTION]\nContinue the current Work '${activeWork.title}' without replanning or resetting its pipeline. Work only inside ${activeWork.run.taskDir ?? activeWork.run.workspaceDir}. Reuse upstream Work artifacts read-only. Execute this focused action: ${instruction}\nReport changed artifacts, validation result, and any blocker.`, instruction); }
     catch (error) { turnEnded.current = true; setStreaming(false); setLogs(items => [...items.slice(-400), { channel: "error", message: error instanceof Error ? error.message : String(error), at: stamp() }]); }
   }
   function requestAnalysis() {
     if (!settings.outputRoot.trim()) { setOutputError(true); setOutputOpen(true); return; }
-    setAnalysisGoal(caseState?.analysisGoal ?? analysisGoal);
-    setAnalysisCategory(caseState?.analysisCategory ?? analysisCategory);
+    setAnalysisGoal("");
+    setAnalysisCategory("report");
     setAnalysisError("");
     setAnalysisOpen(true);
   }
@@ -856,11 +988,9 @@ export function App() {
       const caseInputs = (saved.inputs ?? []).map(item => `- ${item.type}: ${item.name}${item.path ? ` @ ${item.path.replace(/\\/g, "/")}` : ""}${item.packageName ? ` (${item.packageName})` : ""}`).join("\n") || "- No material input has been added yet; start from the operator objective and explicitly identify blockers.";
       const routeOptions = analysisCategory === "app-development" ? "requirements, Android architecture, UI/UX, platform APIs, storage/networking, implementation, Gradle build, automated tests, device installation, and acceptance verification" : analysisCategory === "runtime-diagnostics" ? "ADB device/package snapshot, controlled reproduction, filtered logcat, dumpsys, crash/ANR/tombstone evidence, JADX/IDA correlation, narrow Frida observation, hypothesis discrimination, and focused verification" : "APK triage, JADX Java analysis, IDA native analysis, Frida runtime tracing, Unidbg emulation, request replay, algorithm recovery, and verification";
       setTimeline(items => [...items, { id: crypto.randomUUID(), kind: "user", title: locale === "zh-CN" ? "工作目标" : "Work objective", body: goal, status: "submitted", at: stamp() }]);
-      await initializeAgent(caseId);
+      await initializeAgent(caseId, saved.activeWorkId, true);
       if (generation !== startGeneration.current) return;
-      await window.mobileReverse.prompt(`/reverse-case-use ${caseId}`);
-      if (generation !== startGeneration.current) return;
-      await window.mobileReverse.prompt(`You are starting a goal-driven work run for CASE ${saved.title ?? caseId} (${saved.platform ?? "android"}).
+      await window.mobileReverse.prompt(caseId, saved.activeWorkId, `You are starting a goal-driven work run for CASE ${saved.title ?? caseId} (${saved.platform ?? "android"}).
 
 Mandatory planning gate:
 Analysis category: ${analysisCategory}.
@@ -876,7 +1006,9 @@ ${caseInputs}
 5. Announce the plan, then execute it. Call reverse_analysis_step whenever a stage starts, completes, is skipped, or fails. Reuse confirmed evidence and do not repeat completed work unless the new objective requires revalidation.
 6. Include a REPORT stage only when a report is required. Generate and register ${taskDirectory}/artifacts/delivery.md aligned specifically to this objective, then mark that stage completed with reverse_analysis_step.
 
-The operator's objective is:\n${goal}`);
+The operator's objective is:
+[SEAGULL_USER_MESSAGE]
+${goal}`, goal);
     } catch (error) {
       turnEnded.current = true;
       setStreaming(false);
@@ -890,7 +1022,8 @@ The operator's objective is:\n${goal}`);
     startGeneration.current += 1;
     turnEnded.current = true;
     setStreaming(false);
-    try { await window.mobileReverse.abort(); }
+    const identity = activeSessionIdentity.current;
+    try { await window.mobileReverse.abort(identity.caseId, identity.workId); }
     catch (error) { setLogs(items => [...items.slice(-400), { channel: "error", message: error instanceof Error ? error.message : String(error), at: stamp() }]); }
   }
   async function chooseOutputRoot() { const directory = await window.mobileReverse.selectOutputDirectory(); if (directory) { setSettings({ ...settings, outputRoot: directory }); setOutputError(false); } }
@@ -898,14 +1031,14 @@ The operator's objective is:\n${goal}`);
     if (!settings.outputRoot.trim()) { setOutputError(true); return; }
     await window.mobileReverse.saveSettings(settings);
     setOutputOpen(false);
-    if (apk) { const selectedCaseId = await restoreApk(apk); if (selectedCaseId) await initializeAgent(selectedCaseId, true); }
+    if (apk) { const selected = await restoreApk(apk); if (selected) await initializeAgent(selected.caseId, selected.workId, true); }
   }
   async function saveModelSettings() {
     if (!settings.outputRoot.trim()) { setOutputError(true); return; }
     await window.mobileReverse.saveSettings(settings);
     setSettingsOpen(false);
     setModel(`seagull/${settings.modelId}`);
-    if (apk) { const selectedCaseId = await restoreApk(apk); if (selectedCaseId) await initializeAgent(selectedCaseId, true); }
+    if (apk) { const selected = await restoreApk(apk); if (selected) await initializeAgent(selected.caseId, selected.workId, true); }
   }
   async function refreshModels() {
     setModelsLoading(true); setModelMessage("");
@@ -946,14 +1079,104 @@ The operator's objective is:\n${goal}`);
       if (files.length) setCaseState(await window.mobileReverse.readCase(caseId));
     } catch (error) { setLogs(items => [...items.slice(-400), { channel: "error", message: error instanceof Error ? error.message : String(error), at: stamp() }]); }
   }
+  function showImagePreview(source: string, name = "image.png") {
+    setImagePreview({ source, name });
+  }
+  async function copyPreviewImage() {
+    if (!imagePreview) return;
+    try {
+      const response = await fetch(imagePreview.source);
+      const sourceBlob = await response.blob();
+      let pngBlob = sourceBlob;
+      if (sourceBlob.type !== "image/png") {
+        const bitmap = await createImageBitmap(sourceBlob);
+        const canvas = document.createElement("canvas");
+        canvas.width = bitmap.width;
+        canvas.height = bitmap.height;
+        canvas.getContext("2d")?.drawImage(bitmap, 0, 0);
+        bitmap.close();
+        pngBlob = await new Promise<Blob>((resolve, reject) => canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error("Unable to encode image as PNG")), "image/png"));
+      }
+      await navigator.clipboard.write([new ClipboardItem({ "image/png": pngBlob })]);
+      setImageActionStatus(locale === "zh-CN" ? "图片已复制" : "Image copied");
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      setImageActionStatus(locale === "zh-CN" ? `复制失败：${detail}` : `Copy failed: ${detail}`);
+    }
+  }
+  function downloadPreviewImage() {
+    if (!imagePreview) return;
+    const mimeType = /^data:(image\/[^;]+)/.exec(imagePreview.source)?.[1] ?? "image/png";
+    const extension = mimeType.split("/")[1]?.replace("jpeg", "jpg") ?? "png";
+    const originalName = imagePreview.name.trim() || `image.${extension}`;
+    const filename = /\.[a-z0-9]+$/i.test(originalName) ? originalName : `${originalName}.${extension}`;
+    const link = document.createElement("a");
+    link.href = imagePreview.source;
+    link.download = filename.replace(/[<>:"/\\|?*]/g, "_");
+    link.click();
+    setImageActionStatus(locale === "zh-CN" ? "已开始下载" : "Download started");
+  }
+  function showTextPreview(content: string, name = "pasted-text.txt") {
+    setTextPreview({ content, name });
+  }
+  async function copyPreviewText() {
+    if (!textPreview) return;
+    try {
+      await navigator.clipboard.writeText(textPreview.content);
+      setTextActionStatus(locale === "zh-CN" ? "文本已复制" : "Text copied");
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      setTextActionStatus(locale === "zh-CN" ? `复制失败：${detail}` : `Copy failed: ${detail}`);
+    }
+  }
+  function downloadPreviewText() {
+    if (!textPreview) return;
+    const link = document.createElement("a");
+    const blobUrl = URL.createObjectURL(new Blob([textPreview.content], { type: "text/plain;charset=utf-8" }));
+    const originalName = textPreview.name.trim() || "pasted-text.txt";
+    link.href = blobUrl;
+    link.download = (/\.[a-z0-9]+$/i.test(originalName) ? originalName : `${originalName}.txt`).replace(/[<>:"/\\|?*]/g, "_");
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(blobUrl), 0);
+    setTextActionStatus(locale === "zh-CN" ? "已开始下载" : "Download started");
+  }
+  function restorePastedText(attachment: PastedTextAttachment) {
+    if (!canRestorePastedText(attachment.text)) return;
+    setInput(current => current ? `${current}\n${attachment.text}` : attachment.text);
+    setPastedTexts(current => current.filter(item => item.id !== attachment.id));
+    window.requestAnimationFrame(() => composerInput.current?.focus());
+  }
+  async function movePromptInQueue(promptId: string, direction: "up" | "down") {
+    const identity = activeSessionIdentity.current;
+    try { setPromptQueue(await window.mobileReverse.moveQueuedPrompt(identity.caseId, identity.workId, promptId, direction)); }
+    catch (error) { setQueueError(error instanceof Error ? error.message : String(error)); }
+  }
+  async function deletePromptFromQueue(promptId: string) {
+    const identity = activeSessionIdentity.current;
+    try { setPromptQueue(await window.mobileReverse.deleteQueuedPrompt(identity.caseId, identity.workId, promptId)); queuedTimelineItems.current.delete(promptId); setTimeline(items => items.filter(item => item.id !== `queue-user-${promptId}`)); }
+    catch (error) { setQueueError(error instanceof Error ? error.message : String(error)); }
+  }
+  function editQueuedPrompt(item: PromptQueueItemView) {
+    setQueueEditor(item); setQueueEditorText(item.displayText); setQueueError("");
+  }
+  async function saveQueuedPrompt() {
+    if (!queueEditor || !queueEditorText.trim()) return;
+    const identity = activeSessionIdentity.current;
+    try {
+      setPromptQueue(await window.mobileReverse.updateQueuedPrompt(identity.caseId, identity.workId, queueEditor.id, queueEditorText));
+      const cached = queuedTimelineItems.current.get(queueEditor.id);
+      if (cached) queuedTimelineItems.current.set(queueEditor.id, { ...cached, body: queueEditorText.trim() });
+      setTimeline(items => items.map(item => item.id === `queue-user-${queueEditor.id}` ? { ...item, body: queueEditorText.trim() } : item));
+      setQueueEditor(undefined);
+    } catch (error) { setQueueError(error instanceof Error ? error.message : String(error)); }
+  }
   function handleComposerPaste(event: React.ClipboardEvent<HTMLTextAreaElement>) {
     const imageFiles = Array.from(event.clipboardData.files).filter(file => file.type.startsWith("image/"));
     if (imageFiles.length) { event.preventDefault(); void addImages(imageFiles); return; }
     const pasted = event.clipboardData.getData("text/plain");
-    if (pasted.length < 800 && pasted.split(/\r?\n/).length < 12) return;
+    if (!shouldAttachPastedText(pasted)) return;
     event.preventDefault();
-    const firstLine = pasted.split(/\r?\n/).map(line => line.trim()).find(Boolean) ?? "Pasted text";
-    setPastedTexts(current => [...current, { id: crypto.randomUUID(), name: firstLine.slice(0, 34) + (firstLine.length > 34 ? "…" : ""), text: pasted, expanded: false }].slice(0, 8));
+    setPastedTexts(current => [...current, { id: crypto.randomUUID(), name: pastedTextPreview(pasted), text: pasted }].slice(0, 8));
   }
   async function sendPrompt() {
     const text = input.trim();
@@ -964,19 +1187,30 @@ The operator's objective is:\n${goal}`);
     const attachmentContext = [
       textAttachments.length ? `\n\n[PASTED_TEXT_ATTACHMENTS]\n${textAttachments.map((item, index) => `## Text ${index + 1}: ${item.name}\n${item.text}`).join("\n\n")}` : "",
       files.length ? `\n\n[FILE_ATTACHMENTS]\nThe operator attached these persistent files. Inspect them with the appropriate document, spreadsheet, PDF, archive, or filesystem tools before answering:\n${files.map(file => `- ${file.path} (${file.size} bytes)`).join("\n")}` : "",
+      images.length ? `\n\n[IMAGE_ATTACHMENTS]\n${images.map(image => `- ${image.name} (${image.mimeType})`).join("\n")}` : "",
     ].join("");
     const operatorText = `${text || (locale === "zh-CN" ? "请分析附件。" : "Please analyze the attachments.")}${attachmentContext}`;
-    turnHadAssistantText.current = false; finalRecoveryAttempted.current = false;
-    turnEnded.current = false; setStreaming(true);
+    timelinePinnedToBottom.current = true;
+    setShowTimelineBottomButton(false);
     setInput(""); setPendingImages([]); setPendingFiles([]); setPastedTexts([]);
-    const attachmentSummary = [textAttachments.length ? `${textAttachments.length} ${locale === "zh-CN" ? "个文本片段" : "text snippets"}` : "", files.length ? `${files.length} ${locale === "zh-CN" ? "个文件" : "files"}` : ""].filter(Boolean).join(" · ");
-    setTimeline(items => [...items, { id: crypto.randomUUID(), kind: "user", title: locale === "zh-CN" ? "你" : "You", body: [text, attachmentSummary && `[${attachmentSummary}]\n${[...textAttachments.map(item => item.name), ...files.map(file => file.name)].join("\n")}`].filter(Boolean).join("\n\n"), images: images.map(image => `data:${image.mimeType};base64,${image.data}`), status: "sent", at: stamp() }]);
+    const messageAttachments: HistoryMessageAttachment[] = [
+      ...textAttachments.map(item => ({ kind: "text" as const, name: item.name, detail: `${item.text.length.toLocaleString()} ${locale === "zh-CN" ? "字符" : "characters"}`, content: item.text })),
+      ...files.map(file => ({ kind: "file" as const, name: file.name, path: file.path, detail: file.size < 1024 * 1024 ? `${Math.max(1, Math.round(file.size / 1024))} KB` : `${(file.size / 1024 / 1024).toFixed(1)} MB` })),
+    ];
     const incrementalProjectWork = (caseState?.analysisCategory === "app-reconstruction" || caseState?.analysisCategory === "app-development") && Boolean(caseState.activeRun?.workspaceDir);
     const workContext = activeWork ? `[SEAGULL_WORK_CONTEXT]\nActive case: ${caseId}. Active work: ${activeWork.id} (${activeWork.title}). Category: ${activeWork.category}. This message belongs to that work. Preserve its pipeline, artifacts, upstream inheritance, and current project context; do not silently switch to another historical work.\n\n` : "";
     const promptText = workContext + (incrementalProjectWork ? `[SEAGULL_PROJECT_FOLLOW_UP]\nThis is an incremental follow-up to the existing Android project task, not a new work request. Continue in ${caseState.activeRun?.workspaceDir?.replace(/\\/g, "/")}. Preserve the established architecture and inherited case evidence unless the operator explicitly requests otherwise. Do not call reverse_analysis_plan and do not replace or reset the completed/current pipeline. Inspect the current project, implement only the requested adjustment, run focused build/tests, record changed files and validation, then answer the operator directly. If the requested change genuinely requires a separate deliverable, ask the operator to create a new work item through Start work.\n\nOperator follow-up:\n${operatorText}` : operatorText);
-    try { await window.mobileReverse.prompt(promptText, images); }
+    try {
+      const queued = await window.mobileReverse.prompt(caseId, activeWork?.id, promptText, text || (locale === "zh-CN" ? "请分析附件。" : "Please analyze the attachments."), images);
+      setTimeline(items => {
+        const id = `queue-user-${queued.id}`;
+        const message: TimelineItem = { id, kind: "user", title: locale === "zh-CN" ? "你" : "You", body: text || undefined, attachments: messageAttachments, images: images.map(image => `data:${image.mimeType};base64,${image.data}`), imageNames: images.map(image => image.name), status: queued.status === "queued" ? "queued" : "sent", at: stamp() };
+        if (queued.status === "queued") { queuedTimelineItems.current.set(queued.id, message); return items; }
+        return items.some(item => item.id === id) ? items.map(item => item.id === id ? { ...item, ...message } : item) : [...items, message];
+      });
+    }
     catch (error) {
-      turnEnded.current = true; setStreaming(false);
+      if (!streaming) { turnEnded.current = true; setStreaming(false); }
       setLogs(items => [...items.slice(-400), { channel: "error", message: error instanceof Error ? error.message : String(error), at: stamp() }]);
     }
   }
@@ -1009,12 +1243,21 @@ The operator's objective is:\n${goal}`);
     }
   }
   async function closeIntegratedTerminal(terminalId: string) {
+    terminalClosing.current.add(terminalId);
+    removeTerminalSession(terminalId);
     try { await window.mobileReverse.closeTerminal(terminalId); }
     catch { /* the process may already have exited */ }
+    window.setTimeout(() => terminalClosing.current.delete(terminalId), 2000);
+  }
+  function removeTerminalSession(terminalId: string) {
     setTerminalTabs(current => {
       const index = current.findIndex(tab => tab.id === terminalId);
+      if (index < 0) return current;
       const next = current.filter(tab => tab.id !== terminalId);
-      if (activeTerminalId === terminalId) setActiveTerminalId(next[Math.max(0, index - 1)]?.id ?? next[0]?.id);
+      setActiveTerminalId(activeId => {
+        if (activeId !== terminalId && activeId && next.some(tab => tab.id === activeId)) return activeId;
+        return next[Math.min(index, next.length - 1)]?.id;
+      });
       return next;
     });
     terminalViews.current.delete(terminalId);
@@ -1034,20 +1277,33 @@ The operator's objective is:\n${goal}`);
     if (text) void navigator.clipboard.writeText(text);
   }
   function clearTerminalOutput(terminalId: string) {
+    terminalPending.current.delete(terminalId);
     terminalViews.current.get(terminalId)?.clear();
+    window.mobileReverse.writeTerminal(terminalId, TERMINAL_CLEAR_INPUT);
   }
-  async function buildActiveWork() {
+  async function buildActiveWork(clean = false) {
     if (!caseId || !activeWork || workActionBusy) return;
-    setWorkActionBusy("build"); setWorkActionFeedback(undefined);
+    const action = clean ? "rebuild" : "build";
+    setWorkActionBusy(action); setWorkActionFeedback(undefined);
     try {
-      await window.mobileReverse.buildWork(caseId, activeWork.id);
+      await window.mobileReverse.buildWork(caseId, activeWork.id, clean);
       const apks = await window.mobileReverse.listWorkApks(caseId, activeWork.id);
-      setWorkActionFeedback({ kind: "success", message: locale === "zh-CN" ? `编译成功${apks.length ? `，发现 ${apks.length} 个 APK` : ""}` : `Build succeeded${apks.length ? ` · ${apks.length} APK${apks.length === 1 ? "" : "s"}` : ""}` });
+      setWorkActionFeedback({ kind: "success", message: locale === "zh-CN" ? `${clean ? "重新编译" : "编译"}成功${apks.length ? `，发现 ${apks.length} 个 APK` : ""}` : `${clean ? "Rebuild" : "Build"} succeeded${apks.length ? ` · ${apks.length} APK${apks.length === 1 ? "" : "s"}` : ""}` });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      setWorkActionFeedback({ kind: "error", message: locale === "zh-CN" ? `编译失败：${message}` : `Build failed: ${message}` });
+      setWorkActionFeedback({ kind: "error", message: locale === "zh-CN" ? `${clean ? "重新编译" : "编译"}失败：${message}` : `${clean ? "Rebuild" : "Build"} failed: ${message}` });
       setLogs(items => [...items.slice(-400), { channel: "error", message, at: stamp() }]);
     } finally { setWorkActionBusy(undefined); }
+  }
+
+  async function revealCaseInput(inputId: string) {
+    if (!caseId) return;
+    try { await window.mobileReverse.revealCaseInput(caseId, inputId); }
+    catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setLogs(items => [...items.slice(-400), { channel: "error", message, at: stamp() }]);
+      setWorkActionFeedback({ kind: "error", message: locale === "zh-CN" ? `无法打开输入目录：${message}` : `Could not reveal input: ${message}` });
+    }
   }
   async function openWorkSystemTerminal() {
     if (!activeWorkDirectory) return;
@@ -1113,7 +1369,7 @@ The operator's objective is:\n${goal}`);
       await api.installSkill(idOrUrl);
       setSkillResults(await api.searchSkills(skillQuery));
       setAvailableSkillCount((await api.listSkills()).length);
-      if (caseId) await initializeAgent(caseId, true);
+      if (caseId) await initializeAgent(caseId, activeWork?.id, true);
     } catch (error) { setSkillError(error instanceof Error ? error.message : String(error)); }
     finally { setSkillBusy(undefined); }
   }
@@ -1127,42 +1383,54 @@ The operator's objective is:\n${goal}`);
       <div className="model-pill"><Bot size={15}/>{model}</div>
       <button className="language-switch" disabled={!caseId || initializing} onClick={() => void openCurrentCaseDirectory()} title={locale === "zh-CN" ? `在资源管理器中打开当前结果目录${caseId ? `：${caseId}` : ""}` : `Open current results directory${caseId ? `: ${caseId}` : ""}`}><FolderOpen size={15}/>{locale === "zh-CN" ? "打开结果" : "Open results"}</button>
       {mcp.map(server => { const readiness = mcpReadiness[server.name]; const state = readiness?.ready ? "ready" : server.online ? "connected" : "offline"; return <button type="button" title={readiness?.detail ?? (locale === "zh-CN" ? "橙色表示 MCP 已连接；点击检测目标应用/设备是否就绪" : "Amber means MCP connected; click to check target readiness")} onClick={() => void recheckMcp(server.name)} disabled={Boolean(mcpChecking)} className={`mcp-pill ${state}`} key={server.name}><i/>{server.name.toUpperCase()}<small>{server.count}</small>{mcpChecking === server.name && <RefreshCw size={11} className="spin"/>}</button>; })}
-      <div className="app-menu" ref={appMenu}><button className={`language-switch ${appMenuOpen ? "active" : ""}`} onClick={() => setAppMenuOpen(value => !value)}><Settings size={15}/>{locale === "zh-CN" ? "工具" : "Tools"}<ChevronDown size={13}/></button>{appMenuOpen && <div className="app-menu-popover"><button onClick={() => { setAppMenuOpen(false); void openCasePicker(); }}><FolderOpen size={14}/><span>{locale === "zh-CN" ? "案例管理" : "Case manager"}</span></button><button onClick={() => { setAppMenuOpen(false); setOutputOpen(true); }}><FolderOpen size={14}/><span>{analysisText.outputRoot}</span></button><button onClick={() => { setAppMenuOpen(false); setSettingsOpen(true); }}><Settings size={14}/><span>{t.settings}</span></button><button onClick={() => { setAppMenuOpen(false); void openSkillManager(); }}><BookOpen size={14}/><span>{locale === "zh-CN" ? "Skills 管理" : "Skill manager"}</span></button><button onClick={() => { setAppMenuOpen(false); toggleLocale(); }}><Languages size={14}/><span>{locale === "zh-CN" ? "切换为 English" : "切换为中文"}</span></button></div>}</div>
+      <div className="app-menu" ref={appMenu}><button className={`language-switch ${appMenuOpen ? "active" : ""}`} onClick={() => setAppMenuOpen(value => !value)}><Settings size={15}/>{locale === "zh-CN" ? "工具" : "Tools"}<ChevronDown size={13}/></button>{appMenuOpen && <div className="app-menu-popover"><button onClick={() => { setAppMenuOpen(false); void openCasePicker(); }}><FolderOpen size={14}/><span>{locale === "zh-CN" ? "案例管理" : "Case manager"}</span></button><button onClick={() => { setAppMenuOpen(false); setOutputOpen(true); }}><FolderOpen size={14}/><span>{analysisText.outputRoot}</span></button><button onClick={() => { setAppMenuOpen(false); setSettingsOpen(true); }}><Settings size={14}/><span>{t.settings}</span></button><button onClick={() => { setAppMenuOpen(false); void openSkillManager(); }}><BookOpen size={14}/><span>{locale === "zh-CN" ? "Skills 管理" : "Skill manager"}</span></button><button onClick={() => { setAppMenuOpen(false); toggleTheme(); }}>{theme === "dark" ? <Sun size={14}/> : <Moon size={14}/>}<span>{theme === "dark" ? (locale === "zh-CN" ? "切换为浅色主题" : "Switch to light theme") : (locale === "zh-CN" ? "切换为深色主题" : "Switch to dark theme")}</span></button><button onClick={() => { setAppMenuOpen(false); toggleLocale(); }}><Languages size={14}/><span>{locale === "zh-CN" ? "切换为 English" : "切换为中文"}</span></button></div>}</div>
       {streaming ? <button className="danger" onClick={() => void stopWork()}><CircleStop size={16}/>{t.stop}</button> : <button className="primary" disabled={!caseId || !ready} onClick={requestAnalysis}><Play size={15}/>{locale === "zh-CN" ? "开始工作" : "Start work"}</button>}
     </header>
 
-    {initializing && <div className="initialization-overlay" role="status" aria-live="polite"><div className="initialization-card"><div className="initialization-spinner"><span/><span/><span/></div><strong>{locale === "zh-CN" ? "正在初始化分析环境" : "Initializing analysis environment"}</strong><p>{locale === "zh-CN" ? "正在恢复案例、加载 Pi Skills 并连接 MCP 工具…" : "Restoring the case, loading Pi Skills, and connecting MCP tools…"}</p></div></div>}
 
     <div className={`workspace ${agentExpanded ? "agent-expanded" : ""} ${agentResizing ? "agent-resizing" : ""}`} style={{ "--agent-width": `${agentWidth}px` } as CSSProperties}>
       <aside className="sidebar">
         <button type="button" className="case-head case-switcher" onClick={() => void openCasePicker()} title={locale === "zh-CN" ? "切换历史案例" : "Switch case"}><span>CASE</span><strong>{caseState?.title ?? caseId ?? t.noCase}</strong><small>{caseState?.inputs?.length ? `${caseState.inputs.length} ${locale === "zh-CN" ? "项输入" : "inputs"} · ${caseState.platform ?? "android"}` : caseState?.sha256 ? caseState.sha256.slice(0, 16) + "…" : t.chooseHint}</small><ChevronDown size={14}/></button>
-        <section className="work-list"><header><span>WORKS</span><button type="button" disabled={!caseId || streaming} onClick={requestAnalysis} title={locale === "zh-CN" ? "新建工作" : "New work"}>+</button></header>{works.length > 4 && <div className="work-search"><input value={workQuery} onChange={event => setWorkQuery(event.target.value)} placeholder={locale === "zh-CN" ? "筛选工作…" : "Filter works…"}/>{workQuery && <button onClick={() => setWorkQuery("")}><X size={11}/></button>}</div>}<div>{visibleWorks.length ? visibleWorks.map(work => <article className={work.id === (caseState?.activeWorkId ?? activeWork?.id) ? "active" : ""} key={work.id}><button type="button" className="work-select" disabled={streaming} onClick={() => void switchWork(work.id)}><i className={work.status}/><span><strong>{work.title}</strong><small>{categoryCopy[locale][work.category]?.label ?? work.category} · {work.run.stages.filter(stage => stage.status === "completed" || stage.status === "skipped").length}/{work.run.stages.length}</small></span></button><div className="work-actions"><button type="button" disabled={streaming} onClick={() => void renameWork(work.id)} title={locale === "zh-CN" ? "重命名" : "Rename"}><Pencil size={11}/></button><button type="button" disabled={streaming} onClick={() => branchWork(work.id)} title={locale === "zh-CN" ? "基于此工作新建分支" : "Branch from work"}><Copy size={11}/></button><button type="button" disabled={streaming} onClick={() => void deleteWork(work.id)} title={locale === "zh-CN" ? "删除工作记录" : "Delete work"}><Trash2 size={11}/></button></div></article>) : <p>{workQuery ? (locale === "zh-CN" ? "没有匹配工作" : "No matching works") : (locale === "zh-CN" ? "还没有工作记录" : "No work items")}</p>}</div></section>
+        <section className="work-list"><header><span>WORKS</span><button type="button" disabled={!caseId || initializing} onClick={requestAnalysis} title={locale === "zh-CN" ? "新建工作" : "New work"}>+</button></header>{works.length > 4 && <div className="work-search"><input value={workQuery} onChange={event => setWorkQuery(event.target.value)} placeholder={locale === "zh-CN" ? "筛选工作…" : "Filter works…"}/>{workQuery && <button onClick={() => setWorkQuery("")}><X size={11}/></button>}</div>}<div>{visibleWorks.length ? visibleWorks.map(work => { const activity = caseId ? sessionActivity[agentSessionKey(caseId, work.id)] : undefined; return <article className={`${work.id === (caseState?.activeWorkId ?? activeWork?.id) ? "active" : ""} ${activity?.streaming ? "background-running" : ""}`} key={work.id}><button type="button" className="work-select" disabled={initializing} onClick={() => void switchWork(work.id)}><i className={activity?.streaming ? "running" : work.status}/><span><strong>{work.title}</strong><small>{categoryCopy[locale][work.category]?.label ?? work.category} · {work.run.stages.filter(stage => stage.status === "completed" || stage.status === "skipped").length}/{work.run.stages.length}{activity?.queued ? ` · ${activity.queued} ${locale === "zh-CN" ? "排队" : "queued"}` : ""}</small></span></button><div className="work-actions"><button type="button" disabled={initializing} onClick={() => editWork(work.id)} title={locale === "zh-CN" ? "编辑工作" : "Edit Work"}><Pencil size={11}/></button><button type="button" disabled={initializing} onClick={() => branchWork(work.id)} title={locale === "zh-CN" ? "基于此工作新建分支" : "Branch from work"}><Copy size={11}/></button><button type="button" disabled={initializing || Boolean(activity?.streaming)} onClick={() => void deleteWork(work.id)} title={locale === "zh-CN" ? "删除工作记录" : "Delete work"}><Trash2 size={11}/></button></div></article>; }) : <p>{workQuery ? (locale === "zh-CN" ? "没有匹配工作" : "No matching works") : (locale === "zh-CN" ? "还没有工作记录" : "No work items")}</p>}</div></section>
         <nav>{nav.map(([key, label, Icon]) => <button key={key} className={active === key ? "active" : ""} onClick={() => selectWorkspaceView(key)}><Icon size={16}/>{label}<ChevronRight size={13}/></button>)}</nav>
         <div className="phase-card"><span>{t.workflow.toUpperCase()}</span><div className="phase-name">{currentStageLabel}</div><div className="progress"><i style={{ width: `${runStages.length ? (completedStages / runStages.length) * 100 : 0}%` }}/></div><small>{t.phase} {Math.min(currentStageIndex + 1, runStages.length)} / {runStages.length}</small></div>
       </aside>
 
       <main className={`main-stage ${activityExpanded ? "activity-open" : "activity-closed"}`}>
         <div className="stage-head"><div><span>{t.workspace.toUpperCase()} / {(nav.find(n=>n[0]===active)?.[1] ?? active).toUpperCase()}</span><h1>{nav.find(n=>n[0]===active)?.[1] ?? active}</h1></div><div className={`status ${streaming ? "working" : ready ? "ready" : "idle"}`}><Radio size={14}/>{streaming ? t.working : ready ? t.ready : t.idle}</div></div>
-        {active === "Overview" && <Overview state={caseState} stages={runStages} phaseText={phaseText} currentStageLabel={currentStageLabel} apk={apk} t={t} locale={locale} workActionBusy={workActionBusy} workActionFeedback={workActionFeedback} onReconstruct={requestReconstruction} onOpenDirectory={() => { if (caseId && activeWork) void window.mobileReverse.openWorkDirectory(caseId, activeWork.id); }} onBuild={() => void buildActiveWork()} onInstall={() => void requestWorkInstall()} onIntegratedTerminal={() => void createIntegratedTerminal(activeWorkDirectory, activeWork?.title)} onSystemTerminal={() => void openWorkSystemTerminal()}/>} 
+        {active === "Overview" && <Overview
+          state={caseState} stages={runStages} phaseText={phaseText} currentStageLabel={currentStageLabel}
+          apk={apk} t={t} locale={locale} workActionBusy={workActionBusy} workActionFeedback={workActionFeedback}
+          onReconstruct={requestReconstruction} onRevealInput={inputId => void revealCaseInput(inputId)}
+          onOpenDirectory={() => { if (caseId && activeWork) void window.mobileReverse.openWorkDirectory(caseId, activeWork.id); }}
+          onBuild={() => void buildActiveWork()} onRebuild={() => void buildActiveWork(true)} onInstall={() => void requestWorkInstall()}
+          onIntegratedTerminal={() => void createIntegratedTerminal(activeWorkDirectory, activeWork?.title)} onSystemTerminal={() => void openWorkSystemTerminal()}
+        />}
         {active === "Artifacts" && <Evidence state={caseState} selected={selectedArtifact} content={artifactText} onOpen={openArtifact} onOpenDefault={file => void window.mobileReverse.openArtifact(file)} onReveal={file => void window.mobileReverse.revealArtifact(file)} onTerminal={file => void openArtifactInTerminal(file)} t={t} locale={locale}/>} 
-        <div className={`terminal-route ${active === "Terminal" ? "active" : "inactive"}`}><IntegratedTerminal visible={active === "Terminal"} locale={locale} tabs={terminalTabs} activeId={activeTerminal?.id} onSelect={setActiveTerminalId} onNew={() => void createIntegratedTerminal(activeWorkDirectory, activeWork?.title)} onClose={id => void closeIntegratedTerminal(id)} onWrite={(id, data) => window.mobileReverse.writeTerminal(id, data)} onResize={(id, cols, rows) => window.mobileReverse.resizeTerminal(id, cols, rows)} onReady={registerTerminalView} onCopy={copyTerminalOutput} onClear={clearTerminalOutput}/></div>
+        <div className={`terminal-route ${active === "Terminal" ? "active" : "inactive"}`}><IntegratedTerminal visible={active === "Terminal"} locale={locale} caseId={caseId} tabs={terminalTabs} activeId={activeTerminal?.id} onSelect={setActiveTerminalId} onNew={() => void createIntegratedTerminal(activeWorkDirectory, activeWork?.title)} onClose={id => void closeIntegratedTerminal(id)} onWrite={(id, data) => window.mobileReverse.writeTerminal(id, data)} onResize={(id, cols, rows) => window.mobileReverse.resizeTerminal(id, cols, rows)} onReady={registerTerminalView} onCopy={copyTerminalOutput} onClear={clearTerminalOutput}/></div>
         <section className={`terminal-panel activity-panel ${activityExpanded ? "expanded" : "collapsed"}`}><div className="terminal-tabs"><button className="activity-toggle" onClick={() => setActivityExpanded(value => !value)}><ChevronRight size={14}/><strong>{locale === "zh-CN" ? "活动" : "Activity"}</strong><small>{logs.length}</small></button>{activityExpanded && logTabs.map(([key, label]) => <button className={logTab === key ? "active" : ""} onClick={() => setLogTab(key)} key={key}>{label}</button>)}<div className="terminal-tab-spacer"/>{activityExpanded && <button className={`wrap-toggle ${logWrap ? "active" : ""}`} onClick={() => setLogWrap(value => { const next = !value; localStorage.setItem("seagull.logWrap", String(next)); return next; })}><WrapText size={14}/><span>{locale === "zh-CN" ? "换行" : "Wrap"}</span><kbd>Alt+Z</kbd></button>}</div>{activityExpanded && <div className={`terminal-body ${logWrap ? "wrap" : "no-wrap"}`} ref={terminalBody}>{visibleLogs.length === 0 ? <div className="muted">{t.noLogs}</div> : visibleLogs.map((log, i) => <div className={`log ${log.channel}`} key={`${log.at}-${i}`}><time>{log.at}</time><b>{log.channel}</b><span>{log.message}</span></div>)}</div>}</section>
       </main>
 
       <aside className="agent-panel"><button type="button" role="separator" className="agent-resize-handle" aria-label={locale === "zh-CN" ? "拖动调整聊天栏宽度" : "Drag to resize chat panel"} aria-orientation="vertical" aria-valuemin={320} aria-valuemax={clampAgentPanelWidth(Number.MAX_SAFE_INTEGER, window.innerWidth)} aria-valuenow={agentWidth} title={locale === "zh-CN" ? "拖动调整对话区宽度" : "Drag to resize chat"} onPointerDown={beginAgentResize} onKeyDown={event => { if (event.key === "ArrowLeft") resizeAgentWithKeyboard(1); if (event.key === "ArrowRight") resizeAgentWithKeyboard(-1); }}/><div className="agent-work-context"><span>{caseId ?? "—"}</span><ChevronRight size={10}/><strong>{activeWork?.title ?? (locale === "zh-CN" ? "未选择工作" : "No work selected")}</strong>{activeWork && <small>{categoryCopy[locale][activeWork.category].label}</small>}</div>
         <div className="agent-head"><div><Bot size={18}/><strong>{t.agent}</strong></div><div className="agent-actions"><button className={`skills-button ${usedSkills.length ? "active" : ""}`} onClick={() => setSkillsOpen(value => !value)} title={locale === "zh-CN" ? `当前会话已使用 ${usedSkills.length} 个，可用 ${availableSkillCount} 个` : `${usedSkills.length} used in this session, ${availableSkillCount} available`}><BookOpen size={13}/><span>Skills {usedSkills.length}/{availableSkillCount}</span></button><span>{streaming ? t.running.toUpperCase() : t.agentIdle.toUpperCase()}</span><button onClick={() => setAgentExpanded(value => !value)} title={agentExpanded ? (locale === "zh-CN" ? "恢复工作区" : "Restore workspace") : (locale === "zh-CN" ? "专注对话" : "Focus chat")}>{agentExpanded ? <Minimize2 size={15}/> : <Maximize2 size={15}/>}</button>{skillsOpen && <div className="skills-popover"><header><strong>{locale === "zh-CN" ? `本会话已使用 ${usedSkills.length} / 可用 ${availableSkillCount}` : `${usedSkills.length} used / ${availableSkillCount} available`}</strong><button onClick={() => setSkillsOpen(false)}><X size={13}/></button></header>{usedSkills.length ? <div className="skills-list">{usedSkills.map(skill => <article key={skill.source}><BookOpen size={14}/><div><strong>{skill.name}</strong><small title={skill.source}>{skill.source}</small></div><time>{skill.at}</time></article>)}</div> : <p>{locale === "zh-CN" ? "当前会话尚未激活 Skill。开始 Frida、Unidbg、反混淆等对应任务后，Pi 读取 SKILL.md 时会记录在这里。" : "No skill has been activated in this session. It will appear here when Pi reads its SKILL.md for a matching task."}</p>}<footer><button onClick={() => void openSkillManager()}><Settings size={13}/>{locale === "zh-CN" ? "管理与安装 Skills" : "Manage and install Skills"}</button></footer></div>}</div></div>
-        <div className="timeline" ref={timelineBody}>{timeline.length === 0 ? <div className="agent-empty"><Bug size={30}/><strong>{t.readyAnalysis}</strong><span>{t.readyDesc}</span></div> : timeline.map(item => <article className={`event ${item.kind} ${item.expanded ? "expanded" : "collapsed"}`} key={item.id} onClick={() => item.kind === "tool" && toggleEvent(item.id)}><div className="event-top"><b>{item.kind === "tool" && <ChevronRight size={12}/>} {item.kind === "user" && <UserRound size={12}/>} {item.kind === "tool" ? <ToolGroupTitle item={item} locale={locale}/> : item.title}</b><small>{item.at}</small></div>{item.images?.length ? <div className="message-images">{item.images.map((source, index) => <img src={source} alt={`attachment-${index + 1}`} key={index}/>)}</div> : null}{item.kind === "tool" ? (item.expanded && <ToolEventDetails item={item} locale={locale}/>) : (item.body && <pre>{item.body}</pre>)}{item.status && item.kind !== "tool" && <span className={`event-status ${item.status}`}>{item.status}</span>}</article>)}</div>
-        <div className={`composer ${pendingImages.length || pendingFiles.length || pastedTexts.length ? "has-images" : ""}`}>
+        <div className="timeline" ref={timelineBody}>{initializing ? <div className="work-switch-loader" role="status"><RefreshCw size={20} className="spin"/><strong>{locale === "zh-CN" ? (switchingWorkId ? "正在切换工作" : "正在恢复工作会话") : (switchingWorkId ? "Switching Work" : "Restoring Work session")}</strong><span>{locale === "zh-CN" ? "工作区可以先查看；Pi、Skills 与 MCP 工具将在后台完成加载。" : "The workspace is available while Pi, Skills, and MCP tools finish loading in the background."}</span>{switchingWorkId && <small>{works.find(work => work.id === switchingWorkId)?.title ?? switchingWorkId}</small>}</div> : timeline.length === 0 ? <div className="agent-empty"><Bug size={30}/><strong>{t.readyAnalysis}</strong><span>{t.readyDesc}</span></div> : timeline.map(item => <article className={`event ${item.kind} ${item.expanded ? "expanded" : "collapsed"}`} key={item.id} onClick={() => item.kind === "tool" && toggleEvent(item.id)}><div className="event-top"><b>{item.kind === "tool" && <ChevronRight size={12}/>} {item.kind === "user" && <UserRound size={12}/>} {item.kind === "tool" ? <ToolGroupTitle item={item} locale={locale}/> : item.title}</b><small>{item.at}</small></div><MessageAttachmentCards attachments={item.attachments} locale={locale} onOpenFile={file => void window.mobileReverse.openArtifact(file)} onOpenText={(content, name) => showTextPreview(content, name)}/>{item.images?.length ? <div className="message-images">{item.images.map((source, index) => { const name = item.imageNames?.[index] || (locale === "zh-CN" ? `图片 ${index + 1}` : `Image ${index + 1}`); return <button type="button" className="message-image-trigger" title={name} onClick={event => { event.stopPropagation(); showImagePreview(source, name); }} key={index}><img src={source} alt={name}/><span>{name}</span></button>; })}</div> : null}{item.kind === "tool" ? (item.expanded && <ToolEventDetails item={item} locale={locale}/>) : (item.body && (item.kind === "assistant" ? <MarkdownMessage content={item.body}/> : <pre>{item.body}</pre>))}{item.status && item.kind !== "tool" && <span className={`event-status ${item.status}`}>{item.status}</span>}</article>)}</div>
+        {showTimelineBottomButton && <button type="button" className="timeline-scroll-bottom" title={locale === "zh-CN" ? "跳转到最新消息" : "Jump to latest message"} aria-label={locale === "zh-CN" ? "跳转到最新消息" : "Jump to latest message"} onClick={scrollTimelineToBottom}><ArrowDown size={17}/></button>}
+        <PromptQueuePanel items={promptQueue} expanded={queueExpanded} locale={locale} error={queueError} onToggle={() => setQueueExpanded(value => !value)} onMove={(id, direction) => void movePromptInQueue(id, direction)} onEdit={editQueuedPrompt} onDelete={id => void deletePromptFromQueue(id)}/>
+        <div className={`composer ${pendingFiles.length || pastedTexts.length ? "has-attachment-strip" : ""} ${pendingImages.length ? "has-image-strip" : ""}`}>
           {(pastedTexts.length > 0 || pendingFiles.length > 0) && <div className="pending-attachments">
-            {pastedTexts.map(item => <article className={`text-attachment ${item.expanded ? "expanded" : ""}`} key={item.id}><button type="button" className="attachment-main" onClick={() => setPastedTexts(current => current.map(value => value.id === item.id ? { ...value, expanded: !value.expanded } : value))}><Braces size={16}/><span><strong>{item.name}</strong><small>{item.text.length} {locale === "zh-CN" ? "字符 · 在文本框中显示" : "characters · Show text"}</small></span><ChevronRight size={13}/></button><button type="button" className="attachment-remove" onClick={() => setPastedTexts(current => current.filter(value => value.id !== item.id))}><X size={12}/></button>{item.expanded && <pre>{item.text}</pre>}</article>)}
+            {pastedTexts.map(item => <article className="text-attachment" key={item.id}><button type="button" className="attachment-main" disabled={!canRestorePastedText(item.text)} title={canRestorePastedText(item.text) ? (locale === "zh-CN" ? "将完整文本放回输入框" : "Restore the full text to the composer") : (locale === "zh-CN" ? "超过 25000 字符，仅作为附件发送" : "Over 25,000 characters; send as an attachment only")} onClick={() => restorePastedText(item)}><span className="pasted-text-icon"><Braces size={16}/></span><span><strong>{item.name}</strong><small>{canRestorePastedText(item.text) ? (locale === "zh-CN" ? "在文本框中显示" : "Show in text field") : (locale === "zh-CN" ? `${item.text.length} 字符的大文本` : `${item.text.length} character attachment`)}</small></span><ChevronRight size={13}/></button><button type="button" className="attachment-remove" title={locale === "zh-CN" ? "移除文本附件" : "Remove text attachment"} onClick={() => setPastedTexts(current => current.filter(value => value.id !== item.id))}><X size={12}/></button></article>)}
             {pendingFiles.map(file => <article className="file-attachment" key={file.path}><div className="attachment-main"><FileCode2 size={16}/><span><strong>{file.name}</strong><small>{file.extension || (locale === "zh-CN" ? "文件" : "file")} · {file.size < 1024 * 1024 ? `${Math.max(1, Math.round(file.size / 1024))} KB` : `${(file.size / 1024 / 1024).toFixed(1)} MB`}</small></span></div><button type="button" className="attachment-remove" onClick={() => setPendingFiles(current => current.filter(value => value.path !== file.path))}><X size={12}/></button></article>)}
           </div>}
-          {pendingImages.length > 0 && <div className="pending-images">{pendingImages.map((image, index) => <div key={`${image.name}-${index}`}><img src={`data:${image.mimeType};base64,${image.data}`} alt={image.name}/><button type="button" title={locale === "zh-CN" ? "移除图片" : "Remove image"} onClick={() => setPendingImages(current => current.filter((_, itemIndex) => itemIndex !== index))}><X size={12}/></button></div>)}</div>}
-          <div className="composer-row"><input ref={imageInput} hidden type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple onChange={event => { void addImages(Array.from(event.target.files ?? [])); event.target.value = ""; }}/><button type="button" className="attach-button" title={locale === "zh-CN" ? "添加文件（支持文档、表格、PDF、压缩包、源码及图片）" : "Attach files, documents, spreadsheets, PDFs, archives, source, or images"} onClick={() => void addFileAttachments()}><Paperclip size={16}/></button><textarea value={input} onChange={e => setInput(e.target.value)} onPaste={handleComposerPaste} onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void sendPrompt(); } }} placeholder={locale === "zh-CN" ? "向 Pi 提问，或粘贴长文本/添加文件…" : "Ask Pi, paste long text, or attach files…"}/><button type="button" onClick={sendPrompt} disabled={!input.trim() && pendingImages.length === 0 && pendingFiles.length === 0 && pastedTexts.length === 0}><Send size={16}/></button></div>
+          {pendingImages.length > 0 && <div className="pending-images">{pendingImages.map((image, index) => { const source = `data:${image.mimeType};base64,${image.data}`; return <div key={`${image.name}-${index}`}><button type="button" className="pending-image-trigger" title={locale === "zh-CN" ? "点击预览图片" : "Preview image"} onClick={() => showImagePreview(source, image.name)}><img src={source} alt={image.name}/></button><button type="button" className="pending-image-remove" title={locale === "zh-CN" ? "移除图片" : "Remove image"} onClick={() => setPendingImages(current => current.filter((_, itemIndex) => itemIndex !== index))}><X size={12}/></button></div>; })}</div>}
+          <div className="composer-row"><input ref={imageInput} hidden type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple onChange={event => { void addImages(Array.from(event.target.files ?? [])); event.target.value = ""; }}/><button type="button" className="attach-button" disabled={initializing || !ready} title={locale === "zh-CN" ? "添加文件（支持文档、表格、PDF、压缩包、源码及图片）" : "Attach files, documents, spreadsheets, PDFs, archives, source, or images"} onClick={() => void addFileAttachments()}><Paperclip size={16}/></button><textarea ref={composerInput} disabled={initializing || !ready} value={input} onChange={e => setInput(e.target.value)} onPaste={handleComposerPaste} onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void sendPrompt(); } }} placeholder={initializing ? (locale === "zh-CN" ? "正在切换工作会话…" : "Switching Work session…") : (locale === "zh-CN" ? "向 Pi 提问，或粘贴长文本/添加文件…" : "Ask Pi, paste long text, or attach files…")}/><button type="button" onClick={sendPrompt} disabled={initializing || !ready || (!input.trim() && pendingImages.length === 0 && pendingFiles.length === 0 && pastedTexts.length === 0)}><Send size={16}/></button></div>
         </div>
       </aside>
     </div>
     <footer className={`global-statusbar ${streaming ? "working" : "idle"}`}><div>{streaming ? <Activity size={13}/> : <Radio size={13}/>}<strong>{streaming ? (locale === "zh-CN" ? "正在执行" : "Working") : (locale === "zh-CN" ? "空闲" : "Idle")}</strong><span>{statusActivity}</span></div><div><span>{caseId ?? t.noCase}</span>{streaming && runStages.length > 0 && <span>{Math.min(currentStageIndex + 1, runStages.length)} / {runStages.length}</span>}</div></footer>
+    {imagePreview && createPortal(<div className="image-preview-backdrop" role="dialog" aria-modal="true" aria-label={locale === "zh-CN" ? "图片预览" : "Image preview"} onMouseDown={() => setImagePreview(undefined)}><section className="image-preview-dialog" onMouseDown={event => event.stopPropagation()}><header><div><strong title={imagePreview.name}>{imagePreview.name}</strong>{imageActionStatus && <span>{imageActionStatus}</span>}</div><nav><button type="button" onClick={() => void copyPreviewImage()}><Copy size={15}/>{locale === "zh-CN" ? "复制" : "Copy"}</button><button type="button" onClick={downloadPreviewImage}><Download size={15}/>{locale === "zh-CN" ? "下载" : "Download"}</button><button type="button" className="image-preview-close" title={locale === "zh-CN" ? "关闭" : "Close"} onClick={() => setImagePreview(undefined)}><X size={18}/></button></nav></header><div className="image-preview-canvas"><img src={imagePreview.source} alt={imagePreview.name}/></div></section></div>, document.body)}
+    {textPreview && createPortal(<div className="image-preview-backdrop" role="dialog" aria-modal="true" aria-label={locale === "zh-CN" ? "长文本预览" : "Long text preview"} onMouseDown={() => setTextPreview(undefined)}><section className="image-preview-dialog text-preview-dialog" onMouseDown={event => event.stopPropagation()}><header><div><strong title={textPreview.name}>{textPreview.name}</strong><small>{textPreview.content.length.toLocaleString()} {locale === "zh-CN" ? "字符" : "characters"}</small>{textActionStatus && <span>{textActionStatus}</span>}</div><nav><button type="button" onClick={() => void copyPreviewText()}><Copy size={15}/>{locale === "zh-CN" ? "复制" : "Copy"}</button><button type="button" onClick={downloadPreviewText}><Download size={15}/>{locale === "zh-CN" ? "下载" : "Download"}</button><button type="button" className="image-preview-close" title={locale === "zh-CN" ? "关闭" : "Close"} onClick={() => setTextPreview(undefined)}><X size={18}/></button></nav></header><pre className="text-preview-content">{textPreview.content}</pre></section></div>, document.body)}
+    {queueEditor && createPortal(<div className="modal-backdrop" onMouseDown={() => setQueueEditor(undefined)}><section className="settings-modal queue-editor-modal" onMouseDown={event => event.stopPropagation()}><header><div><Pencil size={18}/><strong>{locale === "zh-CN" ? "编辑排队消息" : "Edit queued message"}</strong></div><button onClick={() => setQueueEditor(undefined)}><X size={17}/></button></header><p>{locale === "zh-CN" ? "只修改用户正文；原有图片和文件附件会继续保留。" : "Only the operator text changes; existing images and file attachments remain attached."}</p><textarea autoFocus value={queueEditorText} onChange={event => { setQueueEditorText(event.target.value); setQueueError(""); }} onKeyDown={event => { if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) void saveQueuedPrompt(); }}/>{queueError && <div className="analysis-error">{queueError}</div>}<footer><button onClick={() => setQueueEditor(undefined)}>{t.cancel}</button><button className="primary" disabled={!queueEditorText.trim()} onClick={() => void saveQueuedPrompt()}>{t.save}</button></footer></section></div>, document.body)}
+    {workEditorId && createPortal(<div className="modal-backdrop" onMouseDown={() => !workEditorBusy && setWorkEditorId(undefined)}><section className="settings-modal work-editor-modal" onMouseDown={event => event.stopPropagation()}><header><div><Pencil size={18}/><strong>{locale === "zh-CN" ? "编辑工作" : "Edit Work"}</strong></div><button disabled={workEditorBusy} onClick={() => setWorkEditorId(undefined)}><X size={17}/></button></header><p>{locale === "zh-CN" ? "修改名称和工作分类。分类会同步到对应历史目标和 CASE 当前状态，不会移动或重命名已有工作目录。" : "Change the title and category. The matching history entry and active CASE state are updated without moving the existing Work directory."}</p><label>{locale === "zh-CN" ? "工作名称" : "Work title"}<input autoFocus maxLength={80} value={workEditorTitle} onChange={event => { setWorkEditorTitle(event.target.value); setWorkEditorError(""); }} onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); void saveWorkEditor(); } }}/></label><label>{locale === "zh-CN" ? "工作分类" : "Work category"}<select value={workEditorCategory} onChange={event => { setWorkEditorCategory(event.target.value as AnalysisCategory); setWorkEditorError(""); }}>{categorySections.map(section => <optgroup label={locale === "zh-CN" ? section.zh : section.en} key={section.id}>{section.categories.map(category => <option value={category} key={category}>{categoryCopy[locale][category].label}</option>)}</optgroup>)}</select></label><div className="work-editor-category-hint">{categoryCopy[locale][workEditorCategory].description}</div>{workEditorError && <div className="analysis-error">{workEditorError}</div>}<footer><button disabled={workEditorBusy} onClick={() => setWorkEditorId(undefined)}>{t.cancel}</button><button className="primary" disabled={workEditorBusy || !workEditorTitle.trim()} onClick={() => void saveWorkEditor()}>{workEditorBusy ? <RefreshCw size={14} className="spin"/> : <Pencil size={14}/>} {workEditorBusy ? (locale === "zh-CN" ? "保存中" : "Saving") : t.save}</button></footer></section></div>, document.body)}
     {caseWizardOpen && createPortal(<div className="modal-backdrop" onMouseDown={() => !caseWizardBusy && setCaseWizardOpen(false)}><section className="settings-modal case-wizard" onMouseDown={event => event.stopPropagation()}><header><div><FolderOpen size={18}/><strong>{caseWizardMode === "create" ? (locale === "zh-CN" ? "创建 CASE" : "Create CASE") : (locale === "zh-CN" ? "添加分析目标" : "Add case input")}</strong></div><button disabled={caseWizardBusy} onClick={() => setCaseWizardOpen(false)}><X size={17}/></button></header>
       {caseId && <div className="case-wizard-mode"><button className={caseWizardMode === "create" ? "selected" : ""} onClick={() => setCaseWizardMode("create")}>{locale === "zh-CN" ? "创建新案例" : "New case"}</button><button className={caseWizardMode === "add" ? "selected" : ""} onClick={() => setCaseWizardMode("add")}>{locale === "zh-CN" ? `添加到 ${caseState?.title ?? caseId}` : `Add to ${caseState?.title ?? caseId}`}</button></div>}
       <div className="case-source-grid">{([
@@ -1185,8 +1453,8 @@ The operator's objective is:\n${goal}`);
       <p>{locale === "zh-CN" ? "案例会保留完整历史和产物。描述可用于区分同一应用的不同分析目的。删除会将完整案例目录移到 Windows 回收站。" : "Cases preserve their complete history and artifacts. Descriptions distinguish different goals for the same app. Deleting moves the complete directory to the Recycle Bin."}</p>
       {caseListError && <div className="analysis-error">{caseListError}</div>}
       <div className="case-list">{casesLoading ? <p>{locale === "zh-CN" ? "正在扫描结果目录…" : "Scanning result directories…"}</p> : cases.length ? cases.map(item => <article className={item.id === caseId ? "active" : ""} key={item.id}>
-        <button type="button" className="case-select" onClick={() => void selectCase(item.id)}><div><strong>{item.title ?? item.id}</strong><span>{item.inputCount ? `${item.inputCount} ${locale === "zh-CN" ? "项输入" : "inputs"} · ${item.platform ?? "android"}` : item.target?.split(/[\\/]/).pop() ?? (locale === "zh-CN" ? "空白案例" : "Blank case")}</span><p>{item.description || (locale === "zh-CN" ? "暂无案例描述" : "No case description")}</p></div><div><small>{categoryCopy[locale][item.analysisCategory ?? "report"]?.label ?? item.analysisCategory ?? item.phase}</small><time>{new Date(item.updatedAt).toLocaleString(locale)}</time><em>{item.artifactCount} {locale === "zh-CN" ? "项产物" : "artifacts"}</em></div></button>
-        <div className="case-row-actions"><button type="button" title={locale === "zh-CN" ? "编辑描述" : "Edit description"} onClick={() => void editCaseDescription(item)}><Pencil size={14}/></button><button type="button" disabled={item.id === caseId && streaming} title={locale === "zh-CN" ? "删除案例" : "Delete case"} onClick={() => void deleteCase(item.id)}><Trash2 size={15}/></button></div>
+        <button type="button" className="case-select" onClick={() => void selectCase(item.id)}><div><strong>{item.title ?? item.id}</strong><span>{item.inputCount ? `${item.inputCount} ${locale === "zh-CN" ? "项输入" : "inputs"} · ${item.platform ?? "android"}` : item.target?.split(/[\\/]/).pop() ?? (locale === "zh-CN" ? "空白案例" : "Blank case")}</span><CaseWorkTags summary={item} locale={locale}/><p>{item.description || (locale === "zh-CN" ? "暂无案例描述" : "No case description")}</p></div><div><small>{item.works?.length ?? (item.analysisCategory ? 1 : 0)} {locale === "zh-CN" ? "个工作" : "works"}</small><time>{new Date(item.updatedAt).toLocaleString(locale)}</time><em>{item.artifactCount} {locale === "zh-CN" ? "项产物" : "artifacts"}</em></div></button>
+        <div className="case-row-actions"><button type="button" title={locale === "zh-CN" ? "编辑描述" : "Edit description"} onClick={() => void editCaseDescription(item)}><Pencil size={14}/></button><button type="button" disabled={Object.entries(sessionActivity).some(([key, activity]) => key.startsWith(`${item.id}:`) && activity.streaming)} title={locale === "zh-CN" ? "删除案例" : "Delete case"} onClick={() => void deleteCase(item.id)}><Trash2 size={15}/></button></div>
       </article>) : <p>{locale === "zh-CN" ? "当前结果目录中没有发现案例。" : "No cases were found in the current output directory."}</p>}</div>
     </section></div>, document.body)}
     {skillManagerOpen && <div className="modal-backdrop" onMouseDown={() => setSkillManagerOpen(false)}><section className="settings-modal skill-manager" onMouseDown={event => event.stopPropagation()}><header><div><BookOpen size={18}/><strong>{locale === "zh-CN" ? "Skills 管理" : "Skill manager"}</strong></div><button onClick={() => setSkillManagerOpen(false)}><X size={17}/></button></header><p>{locale === "zh-CN" ? "“内置/已安装”表示 Pi 已经可以选用，不表示本会话已经激活。第三方 Skill 会安装到 .pi/skills；安装前请核对来源和其中的脚本。" : "Bundled/Installed means Pi can use the skill; it does not mean the current session activated it. Third-party skills live under .pi/skills. Review their source and scripts."}</p><div className="skill-search"><input value={skillQuery} onChange={event => setSkillQuery(event.target.value)} onKeyDown={event => event.key === "Enter" && void findSkills()} placeholder={locale === "zh-CN" ? "搜索名称、说明，或粘贴 GitHub Skill 目录 URL" : "Search names/descriptions or paste a GitHub skill directory URL"}/><button onClick={() => void findSkills()} disabled={Boolean(skillBusy)}><RefreshCw size={14} className={skillBusy === "search" ? "spin" : ""}/>{locale === "zh-CN" ? "搜索" : "Search"}</button>{/^https:\/\/github\.com\//i.test(skillQuery.trim()) && <button className="install-url" onClick={() => void addSkill(skillQuery.trim())} disabled={Boolean(skillBusy)}>{locale === "zh-CN" ? "安装 URL" : "Install URL"}</button>}</div>{skillError && <div className="analysis-error">{skillError}</div>}<div className="skill-results">{skillBusy === "list" ? <p>{locale === "zh-CN" ? "正在读取 Skills…" : "Loading skills…"}</p> : skillResults.length ? skillResults.map(skill => <article key={`${skill.source}-${skill.id}`}><BookOpen size={17}/><div><strong>{skill.name}</strong><p>{skill.description}</p><small>{skill.source === "bundled" ? (locale === "zh-CN" ? "内置" : "Bundled") : skill.source === "installed" ? (locale === "zh-CN" ? "已安装" : "Installed") : skill.repository}</small></div><button disabled={skill.installed || Boolean(skillBusy)} onClick={() => void addSkill(skill.id)}>{skill.installed ? (skill.source === "bundled" ? (locale === "zh-CN" ? "内置" : "Bundled") : (locale === "zh-CN" ? "已安装" : "Installed")) : skillBusy === skill.id ? (locale === "zh-CN" ? "安装中" : "Installing") : (locale === "zh-CN" ? "安装" : "Install")}</button></article>) : <p>{locale === "zh-CN" ? "没有匹配的 Skill。可以粘贴 GitHub 中包含 SKILL.md 的目录地址。" : "No matching skill. Paste a GitHub directory URL containing SKILL.md."}</p>}</div></section></div>}
@@ -1215,6 +1483,23 @@ function ToolGroupTitle({ item, locale }: { item: TimelineItem; locale: Locale }
   return <>{parts.filter(Boolean).join(" · ")}{state ? ` · ${state}` : ""}</>;
 }
 
+function MessageAttachmentCards({ attachments, locale, onOpenFile, onOpenText }: { attachments?: HistoryMessageAttachment[]; locale: Locale; onOpenFile: (path: string) => void; onOpenText: (content: string, name: string) => void }) {
+  if (!attachments?.length) return null;
+  return <div className="message-attachments">{attachments.map((attachment, index) => {
+    const canOpen = Boolean(attachment.path || attachment.content !== undefined);
+    const content = <><span className="message-attachment-icon">{attachment.kind === "text" ? <Braces size={15}/> : <FileCode2 size={15}/>}</span><span><strong title={attachment.name}>{attachment.name}</strong><small>{attachment.detail || (attachment.kind === "text" ? (locale === "zh-CN" ? "粘贴的长文本" : "Pasted text") : (locale === "zh-CN" ? "附件文件" : "Attached file"))}</small></span>{canOpen && <ChevronRight size={13}/>}</>;
+    return canOpen
+      ? <button type="button" title={attachment.content !== undefined ? (locale === "zh-CN" ? "打开完整文本" : "Open full text") : (locale === "zh-CN" ? "使用系统默认应用打开" : "Open with the system default application")} onClick={event => { event.stopPropagation(); if (attachment.content !== undefined) onOpenText(attachment.content, attachment.name); else if (attachment.path) onOpenFile(attachment.path); }} key={`${attachment.kind}-${attachment.name}-${index}`}>{content}</button>
+      : <article key={`${attachment.kind}-${attachment.name}-${index}`}>{content}</article>;
+  })}</div>;
+}
+
+function PromptQueuePanel({ items, expanded, locale, error, onToggle, onMove, onEdit, onDelete }: { items: PromptQueueItemView[]; expanded: boolean; locale: Locale; error?: string; onToggle: () => void; onMove: (id: string, direction: "up" | "down") => void; onEdit: (item: PromptQueueItemView) => void; onDelete: (id: string) => void }) {
+  if (!items.length) return null;
+  const queued = items.filter(item => item.status === "queued");
+  return <section className={`prompt-queue ${expanded ? "expanded" : "collapsed"}`}><button type="button" className="prompt-queue-head" onClick={onToggle}><ChevronRight size={13}/><strong>{locale === "zh-CN" ? `任务队列 · ${items.length}` : `Task queue · ${items.length}`}</strong><span>{items.some(item => item.status === "running") ? (locale === "zh-CN" ? "正在执行" : "Running") : (locale === "zh-CN" ? "等待执行" : "Waiting")}</span></button>{expanded && <div className="prompt-queue-list">{items.map(item => { const queueIndex = queued.findIndex(value => value.id === item.id); return <article className={item.status} key={item.id}><i>{item.status === "running" ? <RefreshCw size={13} className="spin"/> : queueIndex + 1}</i><div><strong>{item.displayText}</strong><small>{item.imageCount ? `${item.imageCount} ${locale === "zh-CN" ? "张图片 · " : "images · "}` : ""}{new Date(item.createdAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" })}</small></div>{item.status === "queued" && <nav><button type="button" disabled={queueIndex <= 0} title={locale === "zh-CN" ? "上移" : "Move up"} onClick={() => onMove(item.id, "up")}><ArrowUp size={12}/></button><button type="button" disabled={queueIndex >= queued.length - 1} title={locale === "zh-CN" ? "下移" : "Move down"} onClick={() => onMove(item.id, "down")}><ArrowDown size={12}/></button><button type="button" title={locale === "zh-CN" ? "重新编辑" : "Edit"} onClick={() => onEdit(item)}><Pencil size={12}/></button><button type="button" title={locale === "zh-CN" ? "删除" : "Delete"} onClick={() => onDelete(item.id)}><Trash2 size={12}/></button></nav>}</article>; })}{error && <div className="prompt-queue-error">{error}</div>}</div>}</section>;
+}
+
 function ToolEventDetails({ item, locale }: { item: TimelineItem; locale: Locale }) {
   const details = item.toolDetails ?? [{ id: item.id, title: item.title, body: item.body, output: item.output, status: item.status, at: item.at }];
   const [openDetails, setOpenDetails] = useState<Set<string>>(() => new Set());
@@ -1233,8 +1518,52 @@ function ToolEventDetails({ item, locale }: { item: TimelineItem; locale: Locale
   })}</div>;
 }
 
-function IntegratedTerminal({ visible, locale, tabs, activeId, onSelect, onNew, onClose, onWrite, onResize, onReady, onCopy, onClear }: { visible: boolean; locale: Locale; tabs: TerminalTab[]; activeId?: string; onSelect: (id: string) => void; onNew: () => void; onClose: (id: string) => void; onWrite: (id: string, data: string) => void; onResize: (id: string, cols: number, rows: number) => void; onReady: (id: string, handle?: XtermHandle) => void; onCopy: (id: string) => void; onClear: (id: string) => void }) {
+function IntegratedTerminal({ visible, locale, caseId, tabs, activeId, onSelect, onNew, onClose, onWrite, onResize, onReady, onCopy, onClear }: { visible: boolean; locale: Locale; caseId?: string; tabs: TerminalTab[]; activeId?: string; onSelect: (id: string) => void; onNew: () => void; onClose: (id: string) => void; onWrite: (id: string, data: string) => void; onResize: (id: string, cols: number, rows: number) => void; onReady: (id: string, handle?: XtermHandle) => void; onCopy: (id: string) => void; onClear: (id: string) => void }) {
   const activeTab = tabs.find(tab => tab.id === activeId) ?? tabs[0];
+  const [quickCommands, setQuickCommands] = useState<TerminalQuickCommand[]>(() => parseTerminalQuickCommands(localStorage.getItem("seagull.terminalQuickCommands")));
+  const [quickOpen, setQuickOpen] = useState(false);
+  const [quickEditorOpen, setQuickEditorOpen] = useState(false);
+  const [quickName, setQuickName] = useState("");
+  const [quickCommand, setQuickCommand] = useState("");
+  const [editingQuickId, setEditingQuickId] = useState<string>();
+  const [quickScope, setQuickScope] = useState<"global" | "case">("global");
+  const [quickFilter, setQuickFilter] = useState<TerminalQuickCommandFilter>("available");
+  const [quickSearch, setQuickSearch] = useState("");
+  const quickMenu = useRef<HTMLDivElement>(null);
+
+  const availableQuickCommands = useMemo(() => filterTerminalQuickCommands(quickCommands, caseId, "available"), [quickCommands, caseId]);
+  const visibleQuickCommands = useMemo(() => filterTerminalQuickCommands(quickCommands, caseId, quickFilter, quickSearch), [quickCommands, caseId, quickFilter, quickSearch]);
+  const globalQuickCount = useMemo(() => quickCommands.filter(item => item.scope === "global").length, [quickCommands]);
+  const caseQuickCount = useMemo(() => quickCommands.filter(item => item.scope === "case" && item.caseId === caseId).length, [quickCommands, caseId]);
+
+  useEffect(() => { localStorage.setItem("seagull.terminalQuickCommands", JSON.stringify(quickCommands)); }, [quickCommands]);
+  useEffect(() => {
+    if (!quickOpen) return;
+    const closeOutside = (event: PointerEvent) => { if (!quickMenu.current?.contains(event.target as Node)) setQuickOpen(false); };
+    const closeEscape = (event: KeyboardEvent) => { if (event.key === "Escape") setQuickOpen(false); };
+    document.addEventListener("pointerdown", closeOutside);
+    document.addEventListener("keydown", closeEscape);
+    return () => { document.removeEventListener("pointerdown", closeOutside); document.removeEventListener("keydown", closeEscape); };
+  }, [quickOpen]);
+
+  const resetQuickEditor = () => { setQuickEditorOpen(false); setEditingQuickId(undefined); setQuickName(""); setQuickCommand(""); setQuickScope("global"); };
+  const createQuickCommand = () => { setEditingQuickId(undefined); setQuickName(""); setQuickCommand(""); setQuickScope(quickFilter === "case" && caseId ? "case" : "global"); setQuickEditorOpen(true); };
+  const editQuickCommand = (item: TerminalQuickCommand) => { setEditingQuickId(item.id); setQuickName(item.name); setQuickCommand(item.command); setQuickScope(item.scope); setQuickEditorOpen(true); };
+  const saveQuickCommand = () => {
+    const name = quickName.trim();
+    const command = quickCommand.trim();
+    if (!name || !command) return;
+    setQuickCommands(current => editingQuickId
+      ? current.map(item => item.id === editingQuickId ? { ...item, name, command, scope: quickScope, caseId: quickScope === "case" ? caseId : undefined } : item)
+      : [...current, { id: crypto.randomUUID(), name, command, scope: quickScope, caseId: quickScope === "case" ? caseId : undefined }].slice(-500));
+    resetQuickEditor();
+  };
+  const runQuickCommand = (item: TerminalQuickCommand) => {
+    if (!activeTab || activeTab.status !== "running") return;
+    onWrite(activeTab.id, terminalCommandPayload(item.command));
+    setQuickOpen(false);
+  };
+
   return <div className="integrated-terminal">
     <header>
       <div className="integrated-terminal-tabs">
@@ -1245,18 +1574,35 @@ function IntegratedTerminal({ visible, locale, tabs, activeId, onSelect, onNew, 
         <button type="button" className="terminal-new" onClick={onNew} title={locale === "zh-CN" ? "在当前工作目录新建终端" : "New terminal in the current work directory"}>+</button>
       </div>
       <nav>
+        <div className="terminal-quick-menu" ref={quickMenu}>
+          <button type="button" className={quickOpen ? "active" : ""} onClick={() => { setQuickOpen(value => !value); if (!quickCommands.length) setQuickEditorOpen(true); }}><Bookmark size={12}/>{locale === "zh-CN" ? "快捷命令" : "Quick commands"}<small>{availableQuickCommands.length}</small></button>
+          {quickOpen && <section className="terminal-quick-popover">
+            <header><div><Bookmark size={16}/><span><strong>{locale === "zh-CN" ? "快捷命令管理" : "Quick command manager"}</strong><small>{locale === "zh-CN" ? "全局命令跨案例可用，CASE 命令仅属于当前案例" : "Global commands work everywhere; CASE commands stay with this case"}</small></span></div><button type="button" onClick={createQuickCommand}>+ {locale === "zh-CN" ? "新增命令" : "Add command"}</button></header>
+            <div className="terminal-quick-toolbar"><div className="terminal-quick-filters">{(["available", "global", "case"] as TerminalQuickCommandFilter[]).map(filter => <button type="button" className={quickFilter === filter ? "selected" : ""} disabled={filter === "case" && !caseId} onClick={() => setQuickFilter(filter)} key={filter}><span>{filter === "available" ? (locale === "zh-CN" ? "当前可用" : "Available") : filter === "global" ? (locale === "zh-CN" ? "全局" : "Global") : "CASE"}</span><small>{filter === "available" ? availableQuickCommands.length : filter === "global" ? globalQuickCount : caseQuickCount}</small></button>)}</div><div className="terminal-quick-search"><span>⌕</span><input value={quickSearch} onChange={event => setQuickSearch(event.target.value)} placeholder={locale === "zh-CN" ? "搜索名称或命令…" : "Search name or command…"}/>{quickSearch && <button type="button" title={locale === "zh-CN" ? "清空搜索" : "Clear search"} onClick={() => setQuickSearch("")}><X size={12}/></button>}</div></div>
+            {quickEditorOpen && <div className="terminal-quick-editor">
+              <div className="terminal-quick-scope"><span>{locale === "zh-CN" ? "保存范围" : "Scope"}</span><div><button type="button" className={quickScope === "global" ? "selected" : ""} onClick={() => setQuickScope("global")}><strong>{locale === "zh-CN" ? "全局快捷命令" : "Global command"}</strong><small>{locale === "zh-CN" ? "所有 CASE 都可使用" : "Available in every CASE"}</small></button><button type="button" disabled={!caseId} className={quickScope === "case" ? "selected" : ""} onClick={() => setQuickScope("case")}><strong>{locale === "zh-CN" ? "CASE 快捷命令" : "CASE command"}</strong><small>{caseId ? (locale === "zh-CN" ? `仅用于 ${caseId}` : `Only for ${caseId}`) : (locale === "zh-CN" ? "请先打开 CASE" : "Open a CASE first")}</small></button></div></div>
+              <label>{locale === "zh-CN" ? "名称" : "Name"}<input autoFocus value={quickName} maxLength={80} onChange={event => setQuickName(event.target.value)} placeholder={locale === "zh-CN" ? "例如：查看 ADB 设备" : "Example: List ADB devices"}/></label>
+              <label>{locale === "zh-CN" ? "命令" : "Command"}<textarea value={quickCommand} onChange={event => setQuickCommand(event.target.value)} placeholder="adb devices -l" onKeyDown={event => { if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) { event.preventDefault(); saveQuickCommand(); } }}/></label>
+              <footer><span>{locale === "zh-CN" ? "Ctrl+Enter 保存" : "Ctrl+Enter to save"}</span><div><button type="button" onClick={resetQuickEditor}>{locale === "zh-CN" ? "取消" : "Cancel"}</button><button type="button" className="primary" disabled={!quickName.trim() || !quickCommand.trim() || (quickScope === "case" && !caseId)} onClick={saveQuickCommand}>{locale === "zh-CN" ? "保存" : "Save"}</button></div></footer>
+            </div>}
+            <div className="terminal-quick-list">{visibleQuickCommands.length ? visibleQuickCommands.map(item => <article key={item.id}>
+              <button type="button" className="terminal-quick-run" disabled={!activeTab || activeTab.status !== "running"} onClick={() => runQuickCommand(item)} title={item.command}><Play size={13}/><span><strong>{item.name}<em className={item.scope}>{item.scope === "global" ? (locale === "zh-CN" ? "全局" : "GLOBAL") : "CASE"}</em></strong><code>{item.command}</code></span></button>
+              <div><button type="button" title={locale === "zh-CN" ? "编辑" : "Edit"} onClick={() => editQuickCommand(item)}><Pencil size={11}/></button><button type="button" title={locale === "zh-CN" ? "删除" : "Delete"} onClick={() => { setQuickCommands(current => current.filter(value => value.id !== item.id)); if (editingQuickId === item.id) resetQuickEditor(); }}><Trash2 size={11}/></button></div>
+            </article>) : !quickEditorOpen && <p>{quickSearch ? (locale === "zh-CN" ? "没有匹配的快捷命令。" : "No commands match your search.") : (locale === "zh-CN" ? "这个分类还没有快捷命令。" : "No commands in this category yet.")}</p>}</div>
+          </section>}
+        </div>
         <button type="button" disabled={!activeTab} onClick={() => activeTab && onCopy(activeTab.id)} title="Ctrl+Shift+C"><Copy size={12}/>{locale === "zh-CN" ? "复制全部" : "Copy all"}</button>
         <button type="button" disabled={!activeTab} onClick={() => activeTab && onClear(activeTab.id)}><Trash2 size={12}/>{locale === "zh-CN" ? "清屏" : "Clear"}</button>
       </nav>
     </header>
     {activeTab ? <>
-      <div className="integrated-terminal-context"><span>{activeTab.status === "running" ? (locale === "zh-CN" ? "ConPTY 运行中" : "ConPTY running") : activeTab.status === "failed" ? (locale === "zh-CN" ? "异常" : "Failed") : (locale === "zh-CN" ? "已退出" : "Exited")}</span><code title={activeTab.cwd}>{activeTab.cwd}</code><small>{locale === "zh-CN" ? "Ctrl+Shift+C 复制 · Ctrl+Shift+V 粘贴" : "Ctrl+Shift+C copy · Ctrl+Shift+V paste"}</small></div>
+      <div className="integrated-terminal-context"><span>{activeTab.status === "running" ? (locale === "zh-CN" ? "ConPTY 运行中" : "ConPTY running") : activeTab.status === "failed" ? (locale === "zh-CN" ? "异常" : "Failed") : (locale === "zh-CN" ? "已退出" : "Exited")}</span><code title={activeTab.cwd}>{activeTab.cwd}</code><small>{locale === "zh-CN" ? "选中后右键复制 · 右键粘贴 · Ctrl+Shift+C/V" : "Select + right-click to copy · Right-click to paste · Ctrl+Shift+C/V"}</small></div>
       <div className="integrated-terminal-canvas">{tabs.map(tab => <XtermView key={tab.id} active={visible && tab.id === activeTab.id} onData={data => onWrite(tab.id, data)} onResize={(cols, rows) => onResize(tab.id, cols, rows)} onReady={handle => onReady(tab.id, handle)}/>)}</div>
     </> : <div className="integrated-terminal-empty"><TerminalSquare size={38}/><strong>{locale === "zh-CN" ? "没有打开的终端" : "No open terminals"}</strong><span>{locale === "zh-CN" ? "点击“新建终端”，或从工作概览、产物页创建终端。" : "Create one here, from the work overview, or from an artifact."}</span><button type="button" onClick={onNew}><TerminalSquare size={14}/>{locale === "zh-CN" ? "新建终端" : "New terminal"}</button></div>}
   </div>;
 }
 
-function Overview({ state, stages, phaseText, currentStageLabel, apk, t, locale, workActionBusy, workActionFeedback, onReconstruct, onOpenDirectory, onBuild, onInstall, onIntegratedTerminal, onSystemTerminal }: { state?: CaseStateView; stages: Array<{ id: string; label: string; status: string }>; phaseText: Record<string, string>; currentStageLabel: string; apk?: string; t: typeof copy[Locale]; locale: Locale; workActionBusy?: "build" | "install"; workActionFeedback?: { kind: "success" | "error"; message: string }; onReconstruct: () => void; onOpenDirectory: () => void; onBuild: () => void; onInstall: () => void; onIntegratedTerminal: () => void; onSystemTerminal: () => void }) {
+function Overview({ state, stages, phaseText, currentStageLabel, apk, t, locale, workActionBusy, workActionFeedback, onReconstruct, onRevealInput, onOpenDirectory, onBuild, onRebuild, onInstall, onIntegratedTerminal, onSystemTerminal }: { state?: CaseStateView; stages: Array<{ id: string; label: string; status: string }>; phaseText: Record<string, string>; currentStageLabel: string; apk?: string; t: typeof copy[Locale]; locale: Locale; workActionBusy?: "build" | "rebuild" | "install"; workActionFeedback?: { kind: "success" | "error"; message: string }; onReconstruct: () => void; onRevealInput: (inputId: string) => void; onOpenDirectory: () => void; onBuild: () => void; onRebuild: () => void; onInstall: () => void; onIntegratedTerminal: () => void; onSystemTerminal: () => void }) {
   const work = state?.works?.find(item => item.id === state.activeWorkId);
   const workArtifacts = work?.artifacts ?? state?.artifacts ?? [];
   const inherited = work?.upstreamWorkIds?.length ?? 0;
@@ -1264,15 +1610,38 @@ function Overview({ state, stages, phaseText, currentStageLabel, apk, t, locale,
   const primaryInput = state?.inputs?.find(item => item.id === state.primaryInputId) ?? state?.inputs?.[0];
   const primaryInputLabel = primaryInput?.path ?? primaryInput?.packageName ?? primaryInput?.metadata?.serial;
   return <div className="overview-grid">
-    <section className="hero-card overview-hero"><div><span>{locale === "zh-CN" ? "当前工作" : "CURRENT WORK"}</span><h2>{work?.title ?? state?.title ?? state?.analysisGoal?.split(/\r?\n/)[0] ?? apk?.split(/[\\/]/).pop() ?? t.noApk}</h2><p>{work?.goal ?? state?.analysisGoal ?? state?.description ?? apk ?? (locale === "zh-CN" ? "当前 CASE 尚未开始工作，可以从右上角创建工作。" : "No Work has started in this CASE yet.")}</p><footer><div>{state?.analysisCategory && <em>{categoryCopy[locale][state.analysisCategory].label}</em>}{(state?.inputs?.length ?? 0) > 1 && <small>+{(state?.inputs?.length ?? 1) - 1} {locale === "zh-CN" ? "项输入" : "inputs"}</small>}</div>{primaryInput && <div className="hero-input" title={primaryInputLabel}><Paperclip size={12}/><strong>{primaryInput.name}</strong><code>{primaryInputLabel ?? "—"}</code>{primaryInput.path && <button type="button" onClick={() => void window.mobileReverse.revealArtifact(primaryInput.path!)} title={locale === "zh-CN" ? "打开文件所在目录" : "Reveal input in file explorer"}><FolderOpen size={12}/></button>}</div>}</footer></div><Activity size={42}/></section>
+    <section className="hero-card overview-hero"><div><span>{locale === "zh-CN" ? "当前工作" : "CURRENT WORK"}</span><h2>{work?.title ?? state?.title ?? state?.analysisGoal?.split(/\r?\n/)[0] ?? apk?.split(/[\\/]/).pop() ?? t.noApk}</h2><p>{work?.goal ?? state?.analysisGoal ?? state?.description ?? apk ?? (locale === "zh-CN" ? "当前 CASE 尚未开始工作，可以从右上角创建工作。" : "No Work has started in this CASE yet.")}</p><footer><div>{state?.analysisCategory && <em>{categoryCopy[locale][state.analysisCategory].label}</em>}{(state?.inputs?.length ?? 0) > 1 && <small>+{(state?.inputs?.length ?? 1) - 1} {locale === "zh-CN" ? "项输入" : "inputs"}</small>}</div>{primaryInput && <div className="hero-input" title={primaryInputLabel}><Paperclip size={12}/><strong>{primaryInput.name}</strong><code>{primaryInputLabel ?? "—"}</code>{primaryInput.path && <button type="button" onClick={() => onRevealInput(primaryInput.id)} title={locale === "zh-CN" ? "打开文件所在目录" : "Reveal input in file explorer"}><FolderOpen size={12}/></button>}</div>}</footer></div><Activity size={42}/></section>
     <section className="overview-summary">
       <article><span>{t.currentPhase.toUpperCase()}</span><div><strong>{currentStageLabel}</strong><small>{state?.activeRun ? new Date(state.activeRun.updatedAt).toLocaleString() : state ? new Date(state.updatedAt).toLocaleString() : t.waiting}</small></div></article>
       <article><span>{locale === "zh-CN" ? "本工作产物" : "WORK ARTIFACTS"}</span><div><strong>{workArtifacts.length}</strong><small>{t.persisted}</small></div></article>
       <article><span>{locale === "zh-CN" ? "继承工作" : "UPSTREAM WORKS"}</span><div><strong>{inherited}</strong><small>{locale === "zh-CN" ? "个已完成上游工作" : "completed upstream works"}</small></div></article>
     </section>
-    <section className="work-directory-card"><div><span>{locale === "zh-CN" ? "工作目录" : "WORK DIRECTORY"}</span><strong title={workDirectory}>{workDirectory ?? (locale === "zh-CN" ? "当前工作尚未创建目录" : "No work directory yet")}</strong>{workActionFeedback && <small className={workActionFeedback.kind} title={workActionFeedback.message}>{workActionFeedback.kind === "success" ? "✓" : "!"} {workActionFeedback.message}</small>}</div><nav><button type="button" disabled={!workDirectory} onClick={onOpenDirectory}><FolderOpen size={13}/>{locale === "zh-CN" ? "打开" : "Open"}</button><button type="button" disabled={!workDirectory || Boolean(workActionBusy)} onClick={onBuild}>{workActionBusy === "build" ? <RefreshCw size={13} className="spin"/> : <Play size={13}/>} {workActionBusy === "build" ? (locale === "zh-CN" ? "编译中" : "Building") : (locale === "zh-CN" ? "编译" : "Build")}</button><button type="button" disabled={!workDirectory || Boolean(workActionBusy)} onClick={onInstall}>{workActionBusy === "install" ? <RefreshCw size={13} className="spin"/> : <Smartphone size={13}/>} {workActionBusy === "install" ? (locale === "zh-CN" ? "安装中" : "Installing") : (locale === "zh-CN" ? "安装" : "Install")}</button><button type="button" disabled={!workDirectory} onClick={onIntegratedTerminal}><TerminalSquare size={13}/>{locale === "zh-CN" ? "应用内终端" : "Integrated terminal"}</button><button type="button" disabled={!workDirectory} onClick={onSystemTerminal}><Maximize2 size={13}/>{locale === "zh-CN" ? "系统终端" : "System terminal"}</button></nav></section>
+    <section className="work-directory-card"><div><span>{locale === "zh-CN" ? "工作目录" : "WORK DIRECTORY"}</span><strong title={workDirectory}>{workDirectory ?? (locale === "zh-CN" ? "当前工作尚未创建目录" : "No work directory yet")}</strong>{workActionFeedback && <small className={workActionFeedback.kind} title={workActionFeedback.message}>{workActionFeedback.kind === "success" ? "✓" : "!"} {workActionFeedback.message}</small>}</div><nav><button type="button" disabled={!workDirectory} onClick={onOpenDirectory}><FolderOpen size={13}/>{locale === "zh-CN" ? "打开" : "Open"}</button><BuildActionMenu locale={locale} disabled={!workDirectory || Boolean(workActionBusy)} busy={workActionBusy} onBuild={onBuild} onRebuild={onRebuild}/><button type="button" disabled={!workDirectory || Boolean(workActionBusy)} onClick={onInstall}>{workActionBusy === "install" ? <RefreshCw size={13} className="spin"/> : <Smartphone size={13}/>} {workActionBusy === "install" ? (locale === "zh-CN" ? "安装中" : "Installing") : (locale === "zh-CN" ? "安装" : "Install")}</button><button type="button" disabled={!workDirectory} onClick={onIntegratedTerminal}><TerminalSquare size={13}/>{locale === "zh-CN" ? "应用内终端" : "Integrated terminal"}</button><button type="button" disabled={!workDirectory} onClick={onSystemTerminal}><Maximize2 size={13}/>{locale === "zh-CN" ? "系统终端" : "System terminal"}</button></nav></section>
     <section className="workflow-card"><div className="section-title"><Activity size={16}/><span>{t.pipeline}</span></div><div className="pipeline dynamic">{stages.map((stage, index) => <div className={`pipeline-step ${stage.status === "completed" ? "done" : stage.status}`} key={stage.id}><i>{stage.status === "completed" ? "✓" : stage.status === "skipped" ? "–" : stage.status === "failed" ? "!" : index + 1}</i><span>{phaseText[stage.id] ?? stage.label}</span></div>)}</div></section>
     {state?.analysisCategory === "deobfuscation" && state.activeRun?.status === "completed" && <section className="reconstruction-cta"><div><strong>{locale === "zh-CN" ? "反混淆成果已可用于下游工作" : "Deobfuscation artifacts are ready for downstream work"}</strong><span>{locale === "zh-CN" ? "创建独立工程并继承当前源码、资源、映射和验证结果。" : "Create an isolated project inheriting current source, resources, maps, and verification evidence."}</span></div><button className="primary" onClick={onReconstruct}><Play size={14}/>{locale === "zh-CN" ? "基于当前结果重构应用" : "Reconstruct from these results"}</button></section>}
+  </div>;
+}
+
+function BuildActionMenu({ locale, disabled, busy, onBuild, onRebuild }: { locale: Locale; disabled: boolean; busy?: "build" | "rebuild" | "install"; onBuild: () => void; onRebuild: () => void }) {
+  const [open, setOpen] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
+  const building = busy === "build" || busy === "rebuild";
+  useEffect(() => {
+    if (!open) return;
+    const close = (event: globalThis.PointerEvent) => { if (!root.current?.contains(event.target as Node)) setOpen(false); };
+    document.addEventListener("pointerdown", close);
+    return () => document.removeEventListener("pointerdown", close);
+  }, [open]);
+  useEffect(() => { if (disabled) setOpen(false); }, [disabled]);
+  const run = (action: () => void) => { setOpen(false); action(); };
+  return <div className={`work-directory-build-menu ${open ? "open" : ""}`} ref={root}>
+    <button type="button" className="build-menu-trigger" disabled={disabled} aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen(value => !value)}>
+      {building ? <RefreshCw size={13} className="spin"/> : <Play size={13}/>}<span>{busy === "rebuild" ? (locale === "zh-CN" ? "重新编译中" : "Rebuilding") : busy === "build" ? (locale === "zh-CN" ? "编译中" : "Building") : (locale === "zh-CN" ? "编译" : "Build")}</span><ChevronDown size={11}/>
+    </button>
+    {open && <div className="build-menu-options" role="menu">
+      <button type="button" role="menuitem" onClick={() => run(onBuild)}><Play size={13}/><span><strong>{locale === "zh-CN" ? "增量编译" : "Incremental build"}</strong><small>{locale === "zh-CN" ? "保留缓存，快速构建" : "Keep caches for a faster build"}</small></span></button>
+      <button type="button" role="menuitem" onClick={() => run(onRebuild)}><RefreshCw size={13}/><span><strong>{locale === "zh-CN" ? "重新编译" : "Clean rebuild"}</strong><small>{locale === "zh-CN" ? "先清理，再完整构建" : "Clean before a full build"}</small></span></button>
+    </div>}
   </div>;
 }
 
@@ -1305,16 +1674,20 @@ function Evidence({ state, selected, content, onOpen, onOpenDefault, onReveal, o
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
   const [children, setChildren] = useState<Record<string, DirectoryEntryInfo[]>>({});
   const [loading, setLoading] = useState<Set<string>>(() => new Set());
+  const [scope, setScope] = useState<"current" | "inherited">("current");
+  const work = state?.works?.find(item => item.id === state.activeWorkId);
+  const currentArtifacts = work ? (work.artifacts ?? []) : (state?.artifacts ?? []);
+  const inheritedArtifacts = work?.artifactSnapshot ?? [];
+  useEffect(() => { setScope("current"); setExpanded(new Set()); setChildren({}); }, [state?.activeWorkId]);
   const roots = useMemo(() => {
-    const work = state?.works?.find(item => item.id === state.activeWorkId);
-    const artifacts = work?.artifacts ?? state?.artifacts ?? [];
+    const artifacts = scope === "current" ? currentArtifacts : inheritedArtifacts;
     const normalize = (value: string) => value.replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
     const directories = artifacts.filter(file => state?.artifactTypes?.[file] === "directory").map(normalize);
     return artifacts
       .filter(file => !directories.some(directory => normalize(file).startsWith(directory + "/")))
       .map(file => ({ name: file.split(/[\\/]/).pop() ?? file, path: file, type: state?.artifactTypes?.[file] === "directory" ? "directory" as const : "file" as const }))
       .sort((a, b) => Number(b.type === "directory") - Number(a.type === "directory") || a.name.localeCompare(b.name));
-  }, [state?.activeWorkId, state?.works, state?.artifacts, state?.artifactTypes]);
+  }, [scope, currentArtifacts, inheritedArtifacts, state?.artifactTypes]);
   const toggleDirectory = async (directory: string) => {
     if (expanded.has(directory)) { setExpanded(current => { const next = new Set(current); next.delete(directory); return next; }); return; }
     setExpanded(current => new Set(current).add(directory));
@@ -1329,7 +1702,7 @@ function Evidence({ state, selected, content, onOpen, onOpenDefault, onReveal, o
     const isExpanded = expanded.has(node.path);
     return <div className="artifact-tree-node" key={node.path}><button style={{ paddingLeft: `${8 + depth * 16}px` }} className={`${selected === node.path ? "active" : ""} ${node.type}`} onClick={() => { onOpen(node.path); if (isDirectory) void toggleDirectory(node.path); }}>{isDirectory ? (isExpanded ? <ChevronDown size={13}/> : <ChevronRight size={13}/>) : <span className="tree-indent"/>}{isDirectory ? <FolderOpen size={15}/> : <FileCode2 size={15}/>}<span>{node.name}</span>{isDirectory && <small>DIR</small>}</button>{isDirectory && isExpanded && <div className="artifact-tree-children">{loading.has(node.path) ? <div className="tree-loading" style={{ paddingLeft: `${28 + depth * 16}px` }}>Loading…</div> : (children[node.path] ?? []).map(child => renderNode(child, depth + 1))}</div>}</div>;
   };
-  return <div className="evidence-view"><div className="artifact-list artifact-tree"><div className="section-title"><ScrollText size={16}/>{t.artifactList}</div>{roots.length ? roots.map(root => renderNode(root)) : <div className="muted pad">{t.noEvidence}</div>}</div><section className="artifact-preview-pane"><header><div><FileCode2 size={14}/><span title={selected}>{selected?.split(/[\\/]/).pop() ?? (locale === "zh-CN" ? "未选择产物" : "No artifact selected")}</span></div><nav><button type="button" disabled={!selected} onClick={() => selected && onOpenDefault(selected)} title={locale === "zh-CN" ? "使用系统默认程序打开" : "Open with the default application"}><FileCode2 size={13}/>{locale === "zh-CN" ? "打开文件" : "Open"}</button><button type="button" disabled={!selected} onClick={() => selected && onReveal(selected)} title={locale === "zh-CN" ? "在资源管理器中打开所在目录" : "Reveal in file explorer"}><FolderOpen size={13}/>{locale === "zh-CN" ? "所在目录" : "Reveal"}</button><button type="button" disabled={!selected} onClick={() => selected && onTerminal(selected)} title={locale === "zh-CN" ? "在产物所在目录打开终端" : "Open a terminal in the artifact directory"}><TerminalSquare size={13}/>{locale === "zh-CN" ? "终端" : "Terminal"}</button></nav></header><pre className="artifact-preview">{content || t.selectEvidence}</pre></section></div>;
+  return <div className="evidence-view"><div className="artifact-list artifact-tree"><div className="section-title"><ScrollText size={16}/><span>{t.artifactList}</span></div>{work && <div className="artifact-scope-tabs"><button type="button" className={scope === "current" ? "active" : ""} onClick={() => setScope("current")}>{locale === "zh-CN" ? "当前工作" : "Current"}<small>{currentArtifacts.length}</small></button><button type="button" className={scope === "inherited" ? "active" : ""} disabled={!inheritedArtifacts.length} onClick={() => setScope("inherited")}>{locale === "zh-CN" ? "继承产物" : "Inherited"}<small>{inheritedArtifacts.length}</small></button></div>}{roots.length ? roots.map(root => renderNode(root)) : <div className="muted pad">{scope === "current" ? t.noEvidence : (locale === "zh-CN" ? "当前工作没有继承上游产物。" : "This Work has no inherited artifacts.")}</div>}</div><section className="artifact-preview-pane"><header><div><FileCode2 size={14}/><span title={selected}>{selected?.split(/[\\/]/).pop() ?? (locale === "zh-CN" ? "未选择产物" : "No artifact selected")}</span></div><nav><button type="button" disabled={!selected} onClick={() => selected && onOpenDefault(selected)} title={locale === "zh-CN" ? "使用系统默认程序打开" : "Open with the default application"}><FileCode2 size={13}/>{locale === "zh-CN" ? "打开文件" : "Open"}</button><button type="button" disabled={!selected} onClick={() => selected && onReveal(selected)} title={locale === "zh-CN" ? "在资源管理器中打开所在目录" : "Reveal in file explorer"}><FolderOpen size={13}/>{locale === "zh-CN" ? "所在目录" : "Reveal"}</button><button type="button" disabled={!selected} onClick={() => selected && onTerminal(selected)} title={locale === "zh-CN" ? "在产物所在目录打开终端" : "Open a terminal in the artifact directory"}><TerminalSquare size={13}/>{locale === "zh-CN" ? "终端" : "Terminal"}</button></nav></header><pre className="artifact-preview">{content || t.selectEvidence}</pre></section></div>;
 }
 
 function Report({ artifact, content, t }: { artifact?: string; content: string; t: typeof copy[Locale] }) {
