@@ -8,14 +8,15 @@ import net from "node:net";
 import { promisify } from "node:util";
 import * as pty from "node-pty";
 import type { IPty } from "node-pty";
-import type { AdbDeviceInfo, AnalysisCategory, AppSettings, CaseInput, CaseInputDraft, CaseSummary, CreateCaseRequest, ImageAttachment, InstallableApk, PromptQueueItemView, RoutedWorkerEvent, TerminalEvent, TerminalSessionInfo, WorkerCommand, WorkerEvent } from "./shared.js";
+import { supportsAndroidProjectActions, type AdbDeviceInfo, type AnalysisCategory, type AppSettings, type CaseInput, type CaseInputDraft, type CaseSummary, type CreateCaseRequest, type ImageAttachment, type InstallableApk, type PromptQueueItemView, type RoutedWorkerEvent, type TerminalEvent, type TerminalSessionInfo, type WorkerCommand, type WorkerEvent } from "./shared.js";
 import { installSkill, listSkills, searchSkills } from "./skills-manager.js";
 import { chooseGradleScript, decodeProcessText, gradleBuildTasks, gradleLockedCleanDirectories, parseGradleDistributionProperties, windowsBatchCommand } from "./gradle-support.js";
 import { applyLegacyWorkInheritance } from "./work-session.js";
 import { orderedCaseWorkSummaries } from "./case-summary.js";
 import { applyWorkMetadataUpdate } from "./work-metadata.js";
-import { moveQueuedPrompt, promptQueueView, replaceQueuedPromptDisplay, type StoredPromptQueueItem } from "./prompt-queue.js";
+import { dedupeFinalResponseRecoveryPrompts, isFinalResponseRecoveryPrompt, moveQueuedPrompt, promptQueueView, replaceQueuedPromptDisplay, type StoredPromptQueueItem } from "./prompt-queue.js";
 import { allIndexedArtifacts, rebuildWorkArtifactOwnership } from "./work-artifacts.js";
+import { caseInputIdentity, dedupeCaseInputs } from "./case-inputs.js";
 
 const projectRoot = path.resolve(__dirname, "../..");
 let mainWindow: BrowserWindow | undefined;
@@ -279,6 +280,8 @@ async function addInputsToState(caseDir: string, state: any, drafts: CaseInputDr
       }
     }
     const input: CaseInput = { id: `input-${Math.random().toString(36).slice(2, 10)}`, type: draft.type, name: draft.name.trim() || (storedPath ? path.basename(storedPath) : draft.packageName ?? "Input"), ...(storedPath ? { path: storedPath } : {}), ...(draft.packageName ? { packageName: draft.packageName } : {}), ...(digest ? { sha256: digest } : {}), ...(draft.metadata ? { metadata: draft.metadata } : {}), addedAt: new Date().toISOString() };
+    const identity = caseInputIdentity(input);
+    if (identity && state.inputs.some((existing: CaseInput) => caseInputIdentity(existing) === identity)) continue;
     state.inputs.push(input); imported.push(input);
   }
   state.primaryInputId ??= imported[0]?.id;
@@ -368,10 +371,13 @@ async function queueFilename(runtime: AgentRuntime): Promise<string> {
 }
 
 async function ensurePromptQueue(runtime: AgentRuntime): Promise<StoredPromptQueueItem[]> {
-  if (runtime.queue) return runtime.queue;
+  if (runtime.queue) {
+    runtime.queue = dedupeFinalResponseRecoveryPrompts(runtime.queue);
+    return runtime.queue;
+  }
   try {
     const parsed = JSON.parse(await readFile(await queueFilename(runtime), "utf8"));
-    runtime.queue = Array.isArray(parsed) ? parsed.map((item: StoredPromptQueueItem) => ({ ...item, status: "queued" as const })) : [];
+    runtime.queue = Array.isArray(parsed) ? dedupeFinalResponseRecoveryPrompts(parsed.map((item: StoredPromptQueueItem) => ({ ...item, status: "queued" as const }))) : [];
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     runtime.queue = [];
@@ -775,6 +781,7 @@ ipcMain.handle("work:build", async (_event, caseId: string, workId: string, clea
   const state = JSON.parse(await readFile(path.join(caseDir, "state.json"), "utf8"));
   const work = Array.isArray(state.works) ? state.works.find((item: { id?: string }) => item.id === workId) : undefined;
   if (!work) throw new Error("Work item not found");
+  if (!supportsAndroidProjectActions(work.category)) throw new Error("This Work type does not own a buildable Android project");
   const cwd = await assertCaseWorkspacePath(path.resolve(work.run?.workspaceDir ?? work.run?.taskDir ?? caseDir));
   if (!(await stat(cwd)).isDirectory()) throw new Error("Work directory does not exist");
   try {
@@ -907,7 +914,47 @@ ipcMain.handle("case:add-inputs", async (_event, caseId: string, inputs: CaseInp
   const stateFile = path.join(caseDir, "state.json");
   const state = JSON.parse(await readFile(stateFile, "utf8"));
   ensureCaseInputModel(state);
+  const existing = dedupeCaseInputs(state.inputs, state.primaryInputId);
+  state.inputs = existing.inputs; state.primaryInputId = existing.primaryInputId;
   await addInputsToState(caseDir, state, Array.isArray(inputs) ? inputs : []);
+  state.updatedAt = new Date().toISOString();
+  await writeFile(stateFile, JSON.stringify(state, null, 2) + "\n");
+  return withArtifactTypes(state);
+});
+ipcMain.handle("case:delete-input", async (_event, caseId: string, inputId: string) => {
+  if (!/^[a-zA-Z0-9._-]+$/.test(caseId) || caseId.includes("..")) throw new Error("Invalid case id");
+  if (!/^[a-zA-Z0-9._-]+$/.test(inputId) || inputId.includes("..")) throw new Error("Invalid input id");
+  const caseDir = await findCaseDir(caseId);
+  const stateFile = path.join(caseDir, "state.json");
+  const state = JSON.parse(await readFile(stateFile, "utf8"));
+  ensureCaseInputModel(state);
+  const target = state.inputs.find((input: CaseInput) => input.id === inputId) as CaseInput | undefined;
+  if (!target) throw new Error("Case input not found");
+  const confirmation = await dialog.showMessageBox(mainWindow!, {
+    type: "warning",
+    buttons: ["取消", "移除输入"],
+    defaultId: 0,
+    cancelId: 0,
+    title: "移除案例输入",
+    message: `确定从 CASE 中移除 “${target.name}” 吗？`,
+    detail: "只会移除 CASE 内保存的副本和输入记录，不会删除最初选择的原始文件。",
+    noLink: true,
+  });
+  if (confirmation.response !== 1) return undefined;
+  state.inputs = state.inputs.filter((input: CaseInput) => input.id !== inputId);
+  if (state.primaryInputId === inputId) state.primaryInputId = state.inputs[0]?.id;
+  const primary = state.inputs.find((input: CaseInput) => input.id === state.primaryInputId) as CaseInput | undefined;
+  state.target = primary?.path ?? primary?.packageName;
+  state.sha256 = primary?.sha256;
+  const stillReferenced = target.path && state.inputs.some((input: CaseInput) => input.path && path.resolve(input.path).toLowerCase() === path.resolve(target.path!).toLowerCase());
+  if (target.path && !stillReferenced) {
+    const resolved = path.resolve(target.path);
+    const inputRoot = path.resolve(caseDir, "inputs");
+    if (resolved.toLowerCase().startsWith(inputRoot.toLowerCase() + path.sep)) {
+      state.artifacts = (state.artifacts ?? []).filter((artifact: string) => path.resolve(artifact).toLowerCase() !== resolved.toLowerCase());
+      try { await shell.trashItem(resolved); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    }
+  }
   state.updatedAt = new Date().toISOString();
   await writeFile(stateFile, JSON.stringify(state, null, 2) + "\n");
   return withArtifactTypes(state);
@@ -1005,6 +1052,13 @@ ipcMain.handle("agent:prompt", async (_event, caseId: string | undefined, workId
   const entry: StoredPromptQueueItem = { id: randomUUID(), caseId, workId, agentText: String(text), displayText: String(displayText).trim() || "Attachment request", images, imageCount: images?.length ?? 0, status: "queued", createdAt: now, updatedAt: now };
   return serializeQueueOperation(runtime, async () => {
     const queue = await ensurePromptQueue(runtime);
+    if (isFinalResponseRecoveryPrompt(entry.agentText)) {
+      const existing = queue.find(item => isFinalResponseRecoveryPrompt(item.agentText));
+      if (existing) {
+        await emitPromptQueue(runtime);
+        return promptQueueView(existing);
+      }
+    }
     queue.push(entry);
     runtime.paused = false;
     await persistPromptQueue(runtime);
@@ -1071,8 +1125,11 @@ ipcMain.handle("case:read", async (_event, caseId: string) => {
     const worksChanged = migrateLegacyWorks(state);
     const inheritanceChanged = ensureLegacyWorkInheritance(state);
     const inputsChanged = ensureCaseInputModel(state);
+    const dedupedInputs = dedupeCaseInputs(state.inputs, state.primaryInputId);
+    const inputDuplicatesChanged = dedupedInputs.removedIds.length > 0;
+    if (inputDuplicatesChanged) { state.inputs = dedupedInputs.inputs; state.primaryInputId = dedupedInputs.primaryInputId; }
     const artifactsChanged = await rebuildWorkArtifactOwnership(state, caseDir);
-    const changed = worksChanged || inheritanceChanged || inputsChanged || artifactsChanged;
+    const changed = worksChanged || inheritanceChanged || inputsChanged || inputDuplicatesChanged || artifactsChanged;
     if (changed) await writeFile(stateFile, JSON.stringify(state, null, 2) + "\n");
     return withArtifactTypes(state);
   }

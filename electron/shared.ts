@@ -68,6 +68,11 @@ export type TerminalEvent =
 
 export type AnalysisCategory = "deobfuscation" | "report" | "parameter-trace" | "algorithm-recovery" | "data-collection" | "runtime-diagnostics" | "protocol-recovery" | "version-diff" | "app-reconstruction" | "app-development";
 
+/** Only engineering Works own a buildable Android project. */
+export function supportsAndroidProjectActions(category?: AnalysisCategory): boolean {
+  return category === "app-reconstruction" || category === "app-development";
+}
+
 export interface AnalysisRunStageView {
   id: string;
   label: string;
@@ -153,6 +158,7 @@ export interface DesktopApi {
   installWorkApk(serial: string, apkPath: string): Promise<WorkActionResult>;
   createCase(request: CreateCaseRequest): Promise<CaseStateView>;
   addCaseInputs(caseId: string, inputs: CaseInputDraft[]): Promise<CaseStateView>;
+  deleteCaseInput(caseId: string, inputId: string): Promise<CaseStateView | undefined>;
   openCaseInput(caseId: string, inputId: string): Promise<void>;
   revealCaseInput(caseId: string, inputId: string): Promise<void>;
   selectOutputDirectory(): Promise<string | undefined>;

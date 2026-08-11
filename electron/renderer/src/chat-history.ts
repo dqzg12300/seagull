@@ -10,6 +10,18 @@ export function visibleUserHistoryText(value: string): string | undefined {
   return visibleOperatorMessage(value);
 }
 
+const finalResponseRecoveryLabels = new Set([
+  "补全上一轮最终答复",
+  "Recover the previous final response",
+]);
+
+/** Queue entries created by the automatic final-answer recovery must not be
+ * mistaken for a new operator turn, otherwise the recovery can trigger itself
+ * again when it receives a new queue id. */
+export function isFinalResponseRecoveryDisplayText(value: string): boolean {
+  return finalResponseRecoveryLabels.has(value.trim());
+}
+
 export type HistoryMessageAttachment = {
   kind: "text" | "file";
   name: string;

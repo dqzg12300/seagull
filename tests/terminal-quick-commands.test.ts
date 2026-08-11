@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { filterTerminalQuickCommands, parseTerminalQuickCommands, terminalCommandPayload } from "../electron/renderer/src/terminal-quick-commands.js";
+import { filterTerminalQuickCommands, isTerminalQuickCommandShortcut, parseTerminalQuickCommands, terminalCommandPayload } from "../electron/renderer/src/terminal-quick-commands.js";
 
 describe("terminal quick commands", () => {
   it("loads only complete saved commands", () => {
@@ -21,5 +21,11 @@ describe("terminal quick commands", () => {
 
   it("converts multiline commands into terminal submissions", () => {
     expect(terminalCommandPayload("pwd\nGet-ChildItem")).toBe("pwd\rGet-ChildItem\r");
+  });
+
+  it("recognizes Ctrl+K and Command+K as the terminal command palette shortcut", () => {
+    expect(isTerminalQuickCommandShortcut({ key: "k", ctrlKey: true, metaKey: false, altKey: false })).toBe(true);
+    expect(isTerminalQuickCommandShortcut({ key: "K", ctrlKey: false, metaKey: true, altKey: false })).toBe(true);
+    expect(isTerminalQuickCommandShortcut({ key: "k", ctrlKey: true, metaKey: false, altKey: true })).toBe(false);
   });
 });

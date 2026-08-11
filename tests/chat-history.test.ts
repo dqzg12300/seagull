@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { historyImageAttachments, historyNeedsFinalResponse, parseVisibleUserHistoryMessage, visibleUserHistoryText } from "../electron/renderer/src/chat-history.js";
+import { historyImageAttachments, historyNeedsFinalResponse, isFinalResponseRecoveryDisplayText, parseVisibleUserHistoryMessage, visibleUserHistoryText } from "../electron/renderer/src/chat-history.js";
 
 describe("chat history display", () => {
   it("keeps a normal operator message unchanged", () => {
@@ -69,6 +69,14 @@ The operator's objective is:
       { role: "assistant", content: [{ type: "text", text: "旧回答" }] },
       { role: "user", content: [{ type: "text", text: "这个问题还没有回答" }] },
     ])).toBe(true);
+  });
+
+  it.each(["补全上一轮最终答复", "Recover the previous final response"])("recognizes automatic recovery queue entries: %s", label => {
+    expect(isFinalResponseRecoveryDisplayText(label)).toBe(true);
+  });
+
+  it("does not classify an operator request as automatic recovery", () => {
+    expect(isFinalResponseRecoveryDisplayText("请补全这份报告")).toBe(false);
   });
 
   it("restores legacy pasted text and file payloads as attachment cards", () => {

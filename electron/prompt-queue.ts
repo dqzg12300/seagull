@@ -5,6 +5,24 @@ export interface StoredPromptQueueItem extends PromptQueueItemView {
   images?: ImageAttachment[];
 }
 
+const finalResponseRecoveryMarker = "[SEAGULL_FINAL_RESPONSE_RECOVERY]";
+
+export function isFinalResponseRecoveryPrompt(value: string): boolean {
+  return value.trimStart().startsWith(finalResponseRecoveryMarker);
+}
+
+/** Keep at most one automatic recovery request in a session queue. Normal
+ * operator prompts are never coalesced, even when their text is identical. */
+export function dedupeFinalResponseRecoveryPrompts(items: StoredPromptQueueItem[]): StoredPromptQueueItem[] {
+  let foundRecovery = false;
+  return items.filter(item => {
+    if (!isFinalResponseRecoveryPrompt(item.agentText)) return true;
+    if (foundRecovery) return false;
+    foundRecovery = true;
+    return true;
+  });
+}
+
 export function promptQueueView(item: StoredPromptQueueItem): PromptQueueItemView {
   const { agentText: _agentText, images, ...view } = item;
   return { ...view, imageCount: images?.length ?? view.imageCount ?? 0 };

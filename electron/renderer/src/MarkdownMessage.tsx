@@ -1,3 +1,4 @@
+import { memo } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -11,7 +12,7 @@ function isExternalHttpUrl(value?: string): value is string {
   }
 }
 
-export function MarkdownMessage({ content }: { content: string }) {
+export const MarkdownMessage = memo(function MarkdownMessage({ content }: { content: string }) {
   return <div className="markdown-message">
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
@@ -22,4 +23,4 @@ export function MarkdownMessage({ content }: { content: string }) {
       }}
     >{content}</ReactMarkdown>
   </div>;
-}
+});

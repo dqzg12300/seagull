@@ -91,6 +91,13 @@
 .work-editor-modal select { width: 100%; height: 38px; border: 1px solid #293a44; border-radius: 4px; background: #091015; color: #d6e2e7; padding: 0 9px; outline: none; font-size: 11px; }
 .work-editor-modal select:focus { border-color: #21cdb2; }
 .work-editor-category-hint { margin-top: 7px; padding: 8px 10px; border-left: 2px solid #28796d; background: #0a1318; color: #718791; font-size: 9px; line-height: 1.5; }
+.case-editor-backdrop { z-index: 110; }
+.case-editor-modal { width: min(580px,calc(100vw - 40px)); }
+.case-editor-modal textarea { width: 100%; min-height: 130px; resize: vertical; border: 1px solid #2a3c46; border-radius: 5px; background: #091116; color: #cfdae0; padding: 10px; outline: none; font: 11px/1.6 ui-monospace,"Cascadia Code",monospace; }
+.case-editor-modal textarea:focus { border-color: #25bea5; }
+.case-editor-modal label > small { justify-self: end; margin-top: -1px; color: #60737d; font: 9px ui-monospace,"Cascadia Code",monospace; }
+.case-editor-modal label > small.near-limit { color: #d6a044; }
+.case-editor-modal footer > span { margin-right: auto; color: #60737d; font-size: 9px; }
 .model-selector { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
 .model-combobox { position: relative; min-width: 0; }
 .model-combobox > input { width: 100%; padding-right: 38px; }

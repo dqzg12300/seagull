@@ -2,7 +2,7 @@ import { contextBridge, ipcRenderer } from "electron";
 import type { DesktopApi, RoutedWorkerEvent, TerminalEvent } from "./shared.js";
 
 const api: DesktopApi = {
-  apiVersion: 21,
+  apiVersion: 22,
   selectApk: () => ipcRenderer.invoke("desktop:select-apk"),
   selectCaseFiles: () => ipcRenderer.invoke("desktop:select-case-files"),
   selectProjectDirectory: () => ipcRenderer.invoke("desktop:select-project-directory"),
@@ -13,6 +13,7 @@ const api: DesktopApi = {
   installWorkApk: (serial, apkPath) => ipcRenderer.invoke("work:install-apk", serial, apkPath),
   createCase: request => ipcRenderer.invoke("case:create", request),
   addCaseInputs: (caseId, inputs) => ipcRenderer.invoke("case:add-inputs", caseId, inputs),
+  deleteCaseInput: (caseId, inputId) => ipcRenderer.invoke("case:delete-input", caseId, inputId),
   openCaseInput: (caseId, inputId) => ipcRenderer.invoke("case:open-input", caseId, inputId),
   revealCaseInput: (caseId, inputId) => ipcRenderer.invoke("case:reveal-input", caseId, inputId),
   selectOutputDirectory: () => ipcRenderer.invoke("desktop:select-output-directory"),

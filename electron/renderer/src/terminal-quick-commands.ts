@@ -44,3 +44,7 @@ export function filterTerminalQuickCommands(commands: TerminalQuickCommand[], ca
 export function terminalCommandPayload(command: string): string {
   return `${command.trim().replace(/\r?\n/g, "\r")}\r`;
 }
+
+export function isTerminalQuickCommandShortcut(event: Pick<KeyboardEvent, "key" | "ctrlKey" | "metaKey" | "altKey">): boolean {
+  return (event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLocaleLowerCase() === "k";
+}
