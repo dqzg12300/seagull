@@ -1,11 +1,13 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage, shell } from "electron";
 import { execFile, fork, spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { appendFile, copyFile, mkdir, open, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
+import { appendFile, copyFile, cp, mkdir, mkdtemp, open, readdir, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import net from "node:net";
 import { promisify } from "node:util";
+import { ZipArchive } from "archiver";
 import * as pty from "node-pty";
 import type { IPty } from "node-pty";
 import { supportsAndroidProjectActions, type AdbDeviceInfo, type AnalysisCategory, type AppSettings, type CaseInput, type CaseInputDraft, type CaseSummary, type CreateCaseRequest, type ImageAttachment, type InstallableApk, type PromptQueueItemView, type RoutedWorkerEvent, type TerminalEvent, type TerminalSessionInfo, type WorkerCommand, type WorkerEvent } from "./shared.js";
@@ -14,11 +16,16 @@ import { chooseGradleScript, decodeProcessText, gradleBuildTasks, gradleLockedCl
 import { applyLegacyWorkInheritance } from "./work-session.js";
 import { orderedCaseWorkSummaries } from "./case-summary.js";
 import { applyWorkMetadataUpdate } from "./work-metadata.js";
-import { dedupeFinalResponseRecoveryPrompts, isFinalResponseRecoveryPrompt, moveQueuedPrompt, promptQueueView, replaceQueuedPromptDisplay, type StoredPromptQueueItem } from "./prompt-queue.js";
+import { dedupeFinalResponseRecoveryPrompts, insertPromptQueueItem, isFinalResponseRecoveryPrompt, moveQueuedPrompt, promptQueueView, removeFailedPromptFromQueue, replaceQueuedPromptDisplay, type StoredPromptQueueItem } from "./prompt-queue.js";
+import { agentTurnFailure, agentTurnWillRetry, latestFailedUserPromptText } from "./agent-turn.js";
 import { allIndexedArtifacts, rebuildWorkArtifactOwnership } from "./work-artifacts.js";
 import { caseInputIdentity, dedupeCaseInputs } from "./case-inputs.js";
+import { apkArchiveEntryNames, parseAdbPackagePaths, safeAdbPackageStem, shouldExportAdbPackage } from "./adb-package-export.js";
+import { modelListRequest, normalizeModelBaseUrl, parseModelIds } from "./model-provider.js";
 
-const projectRoot = path.resolve(__dirname, "../..");
+const sourceProjectRoot = path.resolve(__dirname, "../..");
+const bundledResourceRoot = app.isPackaged ? path.join(process.resourcesPath, "app-resources") : sourceProjectRoot;
+const projectRoot = app.isPackaged ? path.join(app.getPath("userData"), "workspace") : sourceProjectRoot;
 let mainWindow: BrowserWindow | undefined;
 type AgentRuntime = {
   key: string;
@@ -39,6 +46,17 @@ const terminals = new Map<string, { info: TerminalSessionInfo; process: IPty }>(
 const settingsFile = path.join(projectRoot, ".pi", "desktop-settings.json");
 const legacyCasesRoot = path.join(projectRoot, ".pi", "cases");
 const execFileAsync = promisify(execFile);
+
+async function preparePackagedWorkspace(): Promise<void> {
+  if (!app.isPackaged) return;
+  await mkdir(projectRoot, { recursive: true });
+  for (const directory of ["skills", "prompts"]) {
+    const source = path.join(bundledResourceRoot, directory);
+    const destination = path.join(projectRoot, directory);
+    try { await cp(source, destination, { recursive: true, force: true }); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  }
+}
 
 async function withCaseStateLock<T>(caseDir: string, action: () => Promise<T>): Promise<T> {
   const lockFile = path.join(caseDir, ".state.lock");
@@ -216,6 +234,94 @@ async function adbDevices(): Promise<AdbDeviceInfo[]> {
   }).filter(device => Boolean(device.serial));
 }
 
+type MaterializedAdbTarget = { serial: string; packageName: string; sha256: string };
+
+async function createXapkArchive(output: string, packageName: string, serial: string, remotePaths: string[], localFiles: string[], entryNames: string[]): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const destination = createWriteStream(output);
+    const archive = new ZipArchive({ zlib: { level: 9 } });
+    destination.once("close", resolve);
+    destination.once("error", reject);
+    archive.once("error", reject);
+    archive.on("warning", (error: Error) => { if ((error as NodeJS.ErrnoException).code !== "ENOENT") reject(error); });
+    archive.pipe(destination);
+    localFiles.forEach((filename, index) => archive.file(filename, { name: entryNames[index]! }));
+    archive.append(JSON.stringify({
+      xapk_version: 1,
+      package_name: packageName,
+      split_apks: entryNames.map((filename, index) => ({ file: filename, source: remotePaths[index] })),
+      generated_by: "Seagull Mobile Reverse",
+      source_device: serial,
+      generated_at: new Date().toISOString(),
+    }, null, 2) + "\n", { name: "manifest.json" });
+    void archive.finalize();
+  });
+}
+
+async function pullAdbPackage(serial: string, packageName: string, root: string): Promise<{ draft: CaseInputDraft; target: MaterializedAdbTarget }> {
+  if (!serial.trim() || serial.length > 200) throw new Error("ADB device serial is missing or invalid");
+  if (!/^[a-zA-Z0-9_]+(?:\.[a-zA-Z0-9_]+)+$/.test(packageName)) throw new Error(`Invalid Android package name: ${packageName}`);
+  const { stdout } = await execFileAsync("adb", ["-s", serial, "shell", "pm", "path", packageName], { timeout: 30_000, windowsHide: true, maxBuffer: 2 * 1024 * 1024 });
+  const remotePaths = parseAdbPackagePaths(stdout);
+  if (!remotePaths.length) throw new Error(`ADB did not return an APK path for ${packageName} on ${serial}`);
+  const packageRoot = path.join(root, safeAdbPackageStem(packageName));
+  await mkdir(packageRoot, { recursive: true });
+  const entryNames = apkArchiveEntryNames(remotePaths);
+  const localFiles: string[] = [];
+  for (let index = 0; index < remotePaths.length; index += 1) {
+    const destination = path.join(packageRoot, entryNames[index]!);
+    await execFileAsync("adb", ["-s", serial, "pull", remotePaths[index]!, destination], { timeout: 10 * 60_000, windowsHide: true, maxBuffer: 10 * 1024 * 1024 });
+    const info = await stat(destination);
+    if (!info.isFile() || info.size === 0) throw new Error(`ADB pulled an empty APK: ${remotePaths[index]}`);
+    localFiles.push(destination);
+  }
+  const stem = safeAdbPackageStem(packageName);
+  const exportedPath = remotePaths.length === 1 ? path.join(root, `${stem}.apk`) : path.join(root, `${stem}.xapk`);
+  if (remotePaths.length === 1) await copyFile(localFiles[0]!, exportedPath);
+  else await createXapkArchive(exportedPath, packageName, serial, remotePaths, localFiles, entryNames);
+  const digest = await hashFile(exportedPath);
+  return {
+    draft: {
+      type: "apk",
+      name: path.basename(exportedPath),
+      path: exportedPath,
+      packageName,
+      metadata: { source: "adb-pull", serial, packageName, apkCount: String(remotePaths.length), remotePaths: JSON.stringify(remotePaths) },
+    },
+    target: { serial, packageName, sha256: digest },
+  };
+}
+
+async function materializeAdbPackageInputs(drafts: CaseInputDraft[]): Promise<{ drafts: CaseInputDraft[]; targets: MaterializedAdbTarget[]; cleanup: () => Promise<void> }> {
+  const deviceDrafts = drafts.filter(draft => draft.type === "device-package" && shouldExportAdbPackage(draft.metadata));
+  if (!deviceDrafts.length) return { drafts, targets: [], cleanup: async () => undefined };
+  const root = await mkdtemp(path.join(tmpdir(), "seagull-adb-package-"));
+  try {
+    const expanded: CaseInputDraft[] = [];
+    const targets: MaterializedAdbTarget[] = [];
+    for (const draft of drafts) {
+      if (draft.type !== "device-package" || !shouldExportAdbPackage(draft.metadata)) { expanded.push(draft); continue; }
+      const serial = draft.metadata?.serial?.trim() ?? "";
+      const packageName = draft.packageName?.trim() ?? "";
+      const pulled = await pullAdbPackage(serial, packageName, root);
+      expanded.push(pulled.draft, draft);
+      targets.push(pulled.target);
+    }
+    return { drafts: expanded, targets, cleanup: () => rm(root, { recursive: true, force: true }) };
+  } catch (error) {
+    await rm(root, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function selectMaterializedAdbTarget(state: any, targets: MaterializedAdbTarget[]): void {
+  const preferred = targets.flatMap(target => (state.inputs as CaseInput[]).filter(input => input.type === "apk" && (input.sha256 === target.sha256 || (input.metadata?.serial === target.serial && input.metadata?.packageName === target.packageName)))).at(0);
+  if (!preferred) return;
+  state.primaryInputId = preferred.id;
+  state.target = preferred.path;
+  state.sha256 = preferred.sha256;
+}
+
 function canConnect(host: string, port: number, timeoutMs = 1500): Promise<boolean> {
   return new Promise(resolve => {
     const socket = net.createConnection({ host, port });
@@ -306,42 +412,38 @@ async function readSettings(): Promise<AppSettings> {
     const raw = JSON.parse(await readFile(settingsFile, "utf8")) as Omit<AppSettings, "apiKey"> & { encryptedApiKey?: string; apiKey?: string };
     let apiKey = raw.apiKey ?? "";
     if (raw.encryptedApiKey && safeStorage.isEncryptionAvailable()) apiKey = safeStorage.decryptString(Buffer.from(raw.encryptedApiKey, "base64"));
-    return { baseUrl: raw.baseUrl ?? "https://api.openai.com/v1", modelId: raw.modelId ?? "gpt-5.1-codex", apiKey, outputRoot: raw.outputRoot ?? "" };
+    return { baseUrl: raw.baseUrl ?? "https://api.openai.com/v1", modelId: raw.modelId ?? "gpt-5.1-codex", apiKey, outputRoot: raw.outputRoot ?? "", apiProtocol: raw.apiProtocol ?? "openai" };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    return { baseUrl: "https://api.openai.com/v1", modelId: "gpt-5.1-codex", apiKey: "", outputRoot: "" };
+    return { baseUrl: "https://api.openai.com/v1", modelId: "gpt-5.1-codex", apiKey: "", outputRoot: "", apiProtocol: "openai" };
   }
 }
 
 async function saveSettings(settings: AppSettings): Promise<void> {
-  const baseUrl = new URL(settings.baseUrl).toString().replace(/\/$/, "");
+  const apiProtocol = settings.apiProtocol ?? "openai";
+  const baseUrl = normalizeModelBaseUrl(settings.baseUrl, apiProtocol);
   if (!settings.modelId.trim()) throw new Error("Model ID is required");
   await mkdir(path.dirname(settingsFile), { recursive: true });
   const outputRoot = settings.outputRoot.trim() ? path.resolve(settings.outputRoot.trim()) : "";
   if (outputRoot) await mkdir(outputRoot, { recursive: true });
   const stored = safeStorage.isEncryptionAvailable()
-    ? { baseUrl, modelId: settings.modelId.trim(), outputRoot, encryptedApiKey: safeStorage.encryptString(settings.apiKey).toString("base64") }
-    : { baseUrl, modelId: settings.modelId.trim(), outputRoot, apiKey: settings.apiKey };
+    ? { baseUrl, modelId: settings.modelId.trim(), outputRoot, apiProtocol, encryptedApiKey: safeStorage.encryptString(settings.apiKey).toString("base64") }
+    : { baseUrl, modelId: settings.modelId.trim(), outputRoot, apiProtocol, apiKey: settings.apiKey };
   await writeFile(settingsFile, JSON.stringify(stored, null, 2) + "\n");
 }
 
 async function listModels(settings: AppSettings): Promise<string[]> {
   if (!settings.baseUrl.trim() || !settings.apiKey.trim()) throw new Error("API Host and API Key are required");
-  const endpoint = `${settings.baseUrl.trim().replace(/\/$/, "")}/models`;
-  const response = await fetch(endpoint, {
-    headers: { Authorization: `Bearer ${settings.apiKey.trim()}`, Accept: "application/json" },
+  const request = modelListRequest(settings);
+  const response = await fetch(request.endpoint, {
+    headers: request.headers,
     signal: AbortSignal.timeout(20_000),
   });
   const body = await response.text();
-  if (!response.ok) throw new Error(`Model request failed (${response.status}): ${body.slice(0, 300)}`);
+  if (!response.ok) throw new Error(`Model request failed (${response.status}) at ${request.endpoint}: ${body.slice(0, 300)}`);
   let parsed: unknown;
-  try { parsed = JSON.parse(body); } catch { throw new Error("Model endpoint did not return valid JSON"); }
-  const value = parsed as { data?: Array<{ id?: unknown }>; models?: Array<{ id?: unknown } | string> };
-  const entries = value.data ?? value.models ?? [];
-  const models = entries
-    .map(item => typeof item === "string" ? item : typeof item?.id === "string" ? item.id : undefined)
-    .filter((id): id is string => Boolean(id))
-    .sort((a, b) => a.localeCompare(b));
+  try { parsed = JSON.parse(body); } catch { throw new Error(`Model endpoint did not return valid JSON: ${request.endpoint}. Check the API protocol and Host.`); }
+  const models = parseModelIds(parsed);
   if (models.length === 0) throw new Error("The endpoint returned no model IDs");
   return [...new Set(models)];
 }
@@ -392,7 +494,7 @@ async function persistPromptQueue(runtime: AgentRuntime): Promise<void> {
 
 async function emitPromptQueue(runtime: AgentRuntime): Promise<PromptQueueItemView[]> {
   const views = (await ensurePromptQueue(runtime)).map(promptQueueView);
-  emitWorkerEvent(runtime, { type: "queue", items: views });
+  emitWorkerEvent(runtime, { type: "queue", items: views, paused: runtime.paused });
   return views;
 }
 
@@ -427,6 +529,17 @@ async function finishCurrentPrompt(runtime: AgentRuntime): Promise<void> {
   await dispatchNextPrompt(runtime);
 }
 
+async function failCurrentPrompt(runtime: AgentRuntime): Promise<void> {
+  if (!runtime.currentPromptId) return;
+  const queue = await ensurePromptQueue(runtime);
+  runtime.queue = queue.filter(item => item.id !== runtime.currentPromptId && !isFinalResponseRecoveryPrompt(item.agentText));
+  runtime.currentPromptId = undefined;
+  runtime.streaming = false;
+  runtime.paused = runtime.queue.some(item => item.status === "queued");
+  await persistPromptQueue(runtime);
+  await emitPromptQueue(runtime);
+}
+
 function createWorkerRuntime(caseId?: string, workId?: string): AgentRuntime {
   const key = sessionKey(caseId, workId);
   const existing = agentRuntimes.get(key);
@@ -451,7 +564,17 @@ function createWorkerRuntime(caseId?: string, workId?: string): AgentRuntime {
         runtime.pendingInitialization = undefined;
         for (const resolve of pending.resolves) resolve();
       }
-      void serializeQueueOperation(runtime, async () => { await emitPromptQueue(runtime); await dispatchNextPrompt(runtime); });
+      void serializeQueueOperation(runtime, async () => {
+        const queue = await ensurePromptQueue(runtime);
+        const failedPromptText = latestFailedUserPromptText(message.history);
+        if (failedPromptText) {
+          runtime.queue = removeFailedPromptFromQueue(queue, failedPromptText);
+          runtime.paused = runtime.queue.some(item => item.status === "queued");
+          await persistPromptQueue(runtime);
+        }
+        await emitPromptQueue(runtime);
+        await dispatchNextPrompt(runtime);
+      });
     } else {
       runtime.journal.push(message);
       if (runtime.journal.length > 10_000) runtime.journal.splice(1, runtime.journal.length - 10_000);
@@ -465,19 +588,12 @@ function createWorkerRuntime(caseId?: string, workId?: string): AgentRuntime {
     }
     emitWorkerEvent(runtime, message);
     if (message.type === "error" && runtime.currentPromptId) {
-      void serializeQueueOperation(runtime, async () => {
-        const queue = await ensurePromptQueue(runtime);
-        const current = queue.find(item => item.id === runtime.currentPromptId);
-        if (current) { current.status = "queued"; current.updatedAt = new Date().toISOString(); }
-        runtime.currentPromptId = undefined;
-        runtime.streaming = false;
-        runtime.paused = true;
-        await persistPromptQueue(runtime);
-        await emitPromptQueue(runtime);
-      });
+      void serializeQueueOperation(runtime, () => failCurrentPrompt(runtime));
     }
     if (message.type === "agent-event" && (message.event as { type?: string } | undefined)?.type === "agent_end") {
-      void serializeQueueOperation(runtime, () => finishCurrentPrompt(runtime));
+      if (agentTurnWillRetry(message.event)) return;
+      const failed = Boolean(agentTurnFailure(message.event));
+      void serializeQueueOperation(runtime, () => failed ? failCurrentPrompt(runtime) : finishCurrentPrompt(runtime));
     }
   });
   child.stdout?.on("data", chunk => emitWorkerEvent(runtime, { type: "log", channel: "pi", message: chunk.toString() }));
@@ -902,11 +1018,15 @@ ipcMain.handle("case:create", async (_event, request: CreateCaseRequest) => {
   const caseDir = path.join(root, id);
   const now = new Date().toISOString();
   const state: any = { id, title, description: String(request.description ?? "").trim().slice(0, 240), platform: request.platform, createdAt: now, updatedAt: now, phase: "INTAKE", workspaceDir: caseDir, notes: [], artifacts: [], inputs: [] };
-  await Promise.all([mkdir(path.join(caseDir, "artifacts"), { recursive: true }), mkdir(path.join(caseDir, "evidence"), { recursive: true }), mkdir(path.join(caseDir, "works"), { recursive: true })]);
-  const imported = await addInputsToState(caseDir, state, request.inputs ?? []);
-  if (typeof request.primaryInputIndex === "number") { const primary = imported[request.primaryInputIndex]; if (primary) state.primaryInputId = primary.id; }
-  await writeFile(path.join(caseDir, "state.json"), JSON.stringify(state, null, 2) + "\n");
-  return withArtifactTypes(state);
+  const materialized = await materializeAdbPackageInputs(request.inputs ?? []);
+  try {
+    await Promise.all([mkdir(path.join(caseDir, "artifacts"), { recursive: true }), mkdir(path.join(caseDir, "evidence"), { recursive: true }), mkdir(path.join(caseDir, "works"), { recursive: true })]);
+    const imported = await addInputsToState(caseDir, state, materialized.drafts);
+    if (typeof request.primaryInputIndex === "number" && !materialized.targets.length) { const primary = imported[request.primaryInputIndex]; if (primary) state.primaryInputId = primary.id; }
+    selectMaterializedAdbTarget(state, materialized.targets);
+    await writeFile(path.join(caseDir, "state.json"), JSON.stringify(state, null, 2) + "\n");
+    return withArtifactTypes(state);
+  } finally { await materialized.cleanup(); }
 });
 ipcMain.handle("case:add-inputs", async (_event, caseId: string, inputs: CaseInputDraft[]) => {
   if (!/^[a-zA-Z0-9._-]+$/.test(caseId) || caseId.includes("..")) throw new Error("Invalid case id");
@@ -916,10 +1036,14 @@ ipcMain.handle("case:add-inputs", async (_event, caseId: string, inputs: CaseInp
   ensureCaseInputModel(state);
   const existing = dedupeCaseInputs(state.inputs, state.primaryInputId);
   state.inputs = existing.inputs; state.primaryInputId = existing.primaryInputId;
-  await addInputsToState(caseDir, state, Array.isArray(inputs) ? inputs : []);
-  state.updatedAt = new Date().toISOString();
-  await writeFile(stateFile, JSON.stringify(state, null, 2) + "\n");
-  return withArtifactTypes(state);
+  const materialized = await materializeAdbPackageInputs(Array.isArray(inputs) ? inputs : []);
+  try {
+    await addInputsToState(caseDir, state, materialized.drafts);
+    selectMaterializedAdbTarget(state, materialized.targets);
+    state.updatedAt = new Date().toISOString();
+    await writeFile(stateFile, JSON.stringify(state, null, 2) + "\n");
+    return withArtifactTypes(state);
+  } finally { await materialized.cleanup(); }
 });
 ipcMain.handle("case:delete-input", async (_event, caseId: string, inputId: string) => {
   if (!/^[a-zA-Z0-9._-]+$/.test(caseId) || caseId.includes("..")) throw new Error("Invalid case id");
@@ -1059,8 +1183,7 @@ ipcMain.handle("agent:prompt", async (_event, caseId: string | undefined, workId
         return promptQueueView(existing);
       }
     }
-    queue.push(entry);
-    runtime.paused = false;
+    runtime.queue = insertPromptQueueItem(queue, entry);
     await persistPromptQueue(runtime);
     await dispatchNextPrompt(runtime);
     await emitPromptQueue(runtime);
@@ -1076,6 +1199,7 @@ ipcMain.handle("agent:abort", async (_event, caseId?: string, workId?: string) =
       runtime.queue = (await ensurePromptQueue(runtime)).filter(item => item.id !== runtime.currentPromptId);
       runtime.currentPromptId = undefined;
       runtime.streaming = false;
+      runtime.paused = runtime.queue.some(item => item.status === "queued");
       await persistPromptQueue(runtime);
       await emitPromptQueue(runtime);
     }
@@ -1112,7 +1236,16 @@ ipcMain.handle("agent:queue-delete", async (_event, caseId: string | undefined, 
     const target = queue.find(item => item.id === promptId);
     if (target?.status === "running") throw new Error("Stop the running task instead of deleting it from the queue");
     runtime.queue = queue.filter(item => item.id !== promptId);
+    if (!runtime.queue.some(item => item.status === "queued")) runtime.paused = false;
     await persistPromptQueue(runtime);
+    return emitPromptQueue(runtime);
+  });
+});
+ipcMain.handle("agent:queue-resume", async (_event, caseId?: string, workId?: string) => {
+  const runtime = createWorkerRuntime(caseId, workId);
+  return serializeQueueOperation(runtime, async () => {
+    runtime.paused = false;
+    await dispatchNextPrompt(runtime);
     return emitPromptQueue(runtime);
   });
 });
@@ -1403,7 +1536,10 @@ ipcMain.handle("file:list-directory", async (_event, directory: string) => {
   return entries.slice(0, 5000);
 });
 
-app.whenReady().then(createWindow);
+app.whenReady().then(async () => {
+  await preparePackagedWorkspace();
+  await createWindow();
+});
 app.on("window-all-closed", () => { if (process.platform !== "darwin") app.quit(); });
 app.on("activate", () => { if (BrowserWindow.getAllWindows().length === 0) void createWindow(); });
 app.on("before-quit", () => {

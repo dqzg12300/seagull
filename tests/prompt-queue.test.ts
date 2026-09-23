@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { dedupeFinalResponseRecoveryPrompts, moveQueuedPrompt, replaceQueuedPromptDisplay, type StoredPromptQueueItem } from "../electron/prompt-queue.js";
+import { dedupeFinalResponseRecoveryPrompts, insertPromptQueueItem, moveQueuedPrompt, removeFailedPromptFromQueue, replaceQueuedPromptDisplay, type StoredPromptQueueItem } from "../electron/prompt-queue.js";
 
 function item(id: string, status: "queued" | "running" = "queued"): StoredPromptQueueItem {
   return { id, displayText: id, agentText: `context\n${id}\nattachments`, status, createdAt: "now", updatedAt: "now", imageCount: 0 };
@@ -25,5 +25,19 @@ describe("prompt queue", () => {
     const first = { ...item("one"), agentText: "same operator request" };
     const second = { ...item("two"), agentText: "same operator request" };
     expect(dedupeFinalResponseRecoveryPrompts([first, second])).toHaveLength(2);
+  });
+
+  it("runs automatic recovery before already queued operator follow-ups", () => {
+    const running = item("running", "running");
+    const waiting = item("waiting");
+    const recovery = { ...item("recovery"), agentText: "[SEAGULL_FINAL_RESPONSE_RECOVERY] answer the preceding turn" };
+    expect(insertPromptQueueItem([running, waiting], recovery).map(value => value.id)).toEqual(["running", "recovery", "waiting"]);
+  });
+
+  it("removes one restored failed request and stale recovery prompts while preserving follow-ups", () => {
+    const failed = { ...item("failed"), agentText: "failed request" };
+    const duplicateFollowUp = { ...item("same-again"), agentText: "failed request" };
+    const recovery = { ...item("recovery"), agentText: "[SEAGULL_FINAL_RESPONSE_RECOVERY] recover" };
+    expect(removeFailedPromptFromQueue([failed, recovery, duplicateFollowUp, item("continue")], "failed request").map(value => value.id)).toEqual(["same-again", "continue"]);
   });
 });

@@ -53,7 +53,7 @@ export default async function mobileReverse(pi: ExtensionAPI) {
       phase: Type.Optional(Type.Union(PHASES.map(phase => Type.Literal(phase)))),
       note: Type.Optional(Type.String()),
       artifact: Type.Optional(Type.String()),
-    }),
+    }, { required: [] }),
     execute: async (_id, params) => {
       if (!store) throw new Error("Extension has not finished session initialization");
       const state = await store.update({ phase: params.phase as CasePhase | undefined, note: params.note, artifact: params.artifact });

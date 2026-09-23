@@ -1,0 +1,4 @@
+interface:
+  display_name: "PCAP Network Analysis"
+  short_description: "Analyze packet captures and reconstruct network behavior"
+  default_prompt: "Use $pcap-network-analysis to analyze this capture and produce evidence-linked findings."

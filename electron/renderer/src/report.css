@@ -421,6 +421,12 @@
 .adb-package-picker { display: grid; gap: 6px; margin-top: 10px; }
 .adb-package-picker > span { color: #62a99d; font-size: 9px; }
 .adb-package-picker select { min-height: 120px; }
+.adb-export-option { display: flex; align-items: flex-start; gap: 9px; margin-top: 9px; padding: 9px 10px; border: 1px solid #263943; border-radius: 4px; background: #0a1318; color: #8da0a9; cursor: pointer; }
+.adb-export-option:hover { border-color: #356158; background: #0e1b1d; }
+.adb-export-option input { width: 14px; height: 14px; flex: 0 0 auto; margin: 1px 0 0; accent-color: #23cdb1; }
+.adb-export-option > span { min-width: 0; display: grid; gap: 4px; }
+.adb-export-option strong { color: #b8c8ce; font-size: 10px; }
+.adb-export-option small { color: #637983; font-size: 8px; line-height: 1.45; }
 .output-picker { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
 .output-picker button { border: 1px solid #28796e; border-radius: 4px; background: #10201d; color: #22cdb2; padding: 0 16px; }
 .output-modal footer .primary:disabled { opacity: .35; cursor: not-allowed; }

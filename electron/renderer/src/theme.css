@@ -103,6 +103,17 @@
 :root[data-theme="light"] .composer { border-color: #c8d4d8; background: #f4f7f8; }
 :root[data-theme="light"] .composer textarea { border-color: #aebfc6; background: #ffffff; color: #2f434c; }
 :root[data-theme="light"] :is(.attach-button,.timeline-scroll-bottom) { border-color: #afc2c8; background: #ffffff; color: #4f6871; box-shadow: 0 7px 18px rgba(52,70,79,.14); }
+:root[data-theme="light"] .agent-progress-card { border-color: #9fcac1; background: #f6fcfa; color: #52736d; box-shadow: none; }
+:root[data-theme="light"] .agent-progress-main strong { color: #23433e; }
+:root[data-theme="light"] .agent-progress-main span:not(.agent-progress-pulse) { color: #52736d; }
+:root[data-theme="light"] .agent-progress-pulse { background: #dff3ee; color: #078c77; }
+:root[data-theme="light"] .agent-progress-card footer { border-color: #c9e0db; color: #66827d; }
+:root[data-theme="light"] .chat-search-bar.open { border-color: #b8c7cc; background: #ffffff; box-shadow: none; }
+:root[data-theme="light"] .chat-search-bar input { color: #263b43; }
+:root[data-theme="light"] .chat-search-bar button:hover:not(:disabled) { background: #e5f2ef; color: #087d6c; }
+:root[data-theme="light"] .chat-search-current { border-color: #0a9b85 !important; box-shadow: 0 0 0 1px rgba(10,155,133,.25),0 0 16px rgba(10,155,133,.1); }
+:root[data-theme="light"] ::highlight(chat-search-match) { background: rgba(10,155,133,.2); color: inherit; }
+:root[data-theme="light"] ::highlight(chat-search-current-text) { background: #ffd45c; color: #172226; text-decoration: underline 1px #9d7100; }
 :root[data-theme="light"] :is(.pending-attachments,.pending-images) { background: #f4f7f8; }
 :root[data-theme="light"] .analysis-attachment-actions > button { border-color: #9fc3bd; background: #e9f5f2; color: #147f70; }
 :root[data-theme="light"] .analysis-attachment-actions > span { color: #6d8189; }
@@ -197,6 +208,8 @@
   color: #536a73;
 }
 :root[data-theme="light"] .prompt-queue-list { background: #f7fafb; }
+:root[data-theme="light"] .prompt-queue-paused { border-color: #dec49f; background: #fff8ed; color: #805e37; }
+:root[data-theme="light"] .prompt-queue-paused button { border-color: #d4ad78; background: #fff3df; color: #8e5d24; }
 :root[data-theme="light"] .prompt-queue-list article {
   border-color: #c5d2d7;
   background: #ffffff;
@@ -278,6 +291,15 @@
 :root[data-theme="light"] .case-source-grid > button:hover { border-color: #78b3a9; background: #f0f7f5; }
 :root[data-theme="light"] .case-source-grid > button.selected { border-color: #319887; background: #e5f3ef; color: #087d6c; }
 :root[data-theme="light"] .case-source-grid > button strong { color: #30454d; }
+:root[data-theme="light"] .case-wizard-fields input,
+:root[data-theme="light"] .case-wizard-fields select,
+:root[data-theme="light"] .case-wizard-fields textarea,
+:root[data-theme="light"] .adb-package-picker input,
+:root[data-theme="light"] .adb-package-picker select { border-color: #b9c8ce; background: #ffffff; color: #354a53; }
+:root[data-theme="light"] .adb-export-option { border-color: #c5d2d7; background: #ffffff; color: #526871; }
+:root[data-theme="light"] .adb-export-option:hover { border-color: #65aa9f; background: #edf6f3; }
+:root[data-theme="light"] .adb-export-option strong { color: #30454d; }
+:root[data-theme="light"] .adb-export-option small { color: #657b84; }
 :root[data-theme="light"] .case-list > p { border-color: #c1ced3; color: #657a83; }
 :root[data-theme="light"] .case-list > article:hover,
 :root[data-theme="light"] .case-list > article.active { border-color: #65aa9f; background: #e7f3f0; }

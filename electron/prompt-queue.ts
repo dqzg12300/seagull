@@ -23,6 +23,31 @@ export function dedupeFinalResponseRecoveryPrompts(items: StoredPromptQueueItem[
   });
 }
 
+/** Remove one failed operator request restored by an older build, together
+ * with automatic recovery prompts that can no longer refer to a valid turn. */
+export function removeFailedPromptFromQueue(items: StoredPromptQueueItem[], agentText: string | undefined): StoredPromptQueueItem[] {
+  let removedFailedPrompt = false;
+  return items.filter(item => {
+    if (isFinalResponseRecoveryPrompt(item.agentText)) return false;
+    if (!removedFailedPrompt && agentText && item.status === "queued" && item.agentText.trim() === agentText.trim()) {
+      removedFailedPrompt = true;
+      return false;
+    }
+    return true;
+  });
+}
+
+/** A recovery refers to the turn that just ended, so it must run before already
+ * queued operator follow-ups. Appending it to the tail makes "previous turn"
+ * point at the wrong request by the time it executes. */
+export function insertPromptQueueItem(items: StoredPromptQueueItem[], entry: StoredPromptQueueItem): StoredPromptQueueItem[] {
+  if (!isFinalResponseRecoveryPrompt(entry.agentText)) return [...items, entry];
+  if (items.some(item => isFinalResponseRecoveryPrompt(item.agentText))) return items;
+  const firstWaiting = items.findIndex(item => item.status === "queued");
+  if (firstWaiting < 0) return [...items, entry];
+  return [...items.slice(0, firstWaiting), entry, ...items.slice(firstWaiting)];
+}
+
 export function promptQueueView(item: StoredPromptQueueItem): PromptQueueItemView {
   const { agentText: _agentText, images, ...view } = item;
   return { ...view, imageCount: images?.length ?? view.imageCount ?? 0 };

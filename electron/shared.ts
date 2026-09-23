@@ -11,7 +11,7 @@ export type WorkerEvent =
   | { type: "state"; streaming: boolean; model?: string; thinkingLevel?: string }
   | { type: "error"; message: string; stack?: string }
   | { type: "log"; channel: string; message: string }
-  | { type: "queue"; items: PromptQueueItemView[] };
+  | { type: "queue"; items: PromptQueueItemView[]; paused?: boolean };
 
 export type RoutedWorkerEvent = WorkerEvent & { sessionKey?: string; caseId?: string; workId?: string };
 
@@ -110,11 +110,14 @@ export interface WorkView {
   upstreamWorkIds?: string[];
 }
 
+export type ModelApiProtocol = "openai" | "anthropic";
+
 export interface AppSettings {
   baseUrl: string;
   apiKey: string;
   modelId: string;
   outputRoot: string;
+  apiProtocol: ModelApiProtocol;
 }
 
 export interface ImageAttachment { name: string; mimeType: "image/png" | "image/jpeg" | "image/gif" | "image/webp"; data: string }
@@ -188,6 +191,7 @@ export interface DesktopApi {
   updateQueuedPrompt(caseId: string | undefined, workId: string | undefined, promptId: string, displayText: string): Promise<PromptQueueItemView[]>;
   moveQueuedPrompt(caseId: string | undefined, workId: string | undefined, promptId: string, direction: "up" | "down"): Promise<PromptQueueItemView[]>;
   deleteQueuedPrompt(caseId: string | undefined, workId: string | undefined, promptId: string): Promise<PromptQueueItemView[]>;
+  resumePromptQueue(caseId?: string, workId?: string): Promise<PromptQueueItemView[]>;
   readCase(caseId: string): Promise<CaseStateView | undefined>;
   listCases(): Promise<CaseSummary[]>;
   deleteCase(caseId: string): Promise<boolean>;

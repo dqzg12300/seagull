@@ -1,4 +1,5 @@
 import { visibleOperatorMessage } from "../../work-session.js";
+import { assistantMessageFailure } from "../../agent-turn.js";
 
 /**
  * Pi stores the exact prompt it receives. Some prompts prepend work routing and
@@ -124,6 +125,7 @@ function historyContentText(content: unknown): string {
 export function historyNeedsFinalResponse(messages: unknown[]): boolean {
   let sawVisibleUser = false;
   let finalTextAfterUser = false;
+  let terminalFailureAfterUser = false;
   for (const raw of messages) {
     const message = raw as { role?: string; content?: unknown };
     if (message.role === "user") {
@@ -131,10 +133,12 @@ export function historyNeedsFinalResponse(messages: unknown[]): boolean {
       if (!visibleUserHistoryText(historyContentText(message.content)) && !hasImage) continue;
       sawVisibleUser = true;
       finalTextAfterUser = false;
+      terminalFailureAfterUser = false;
       continue;
     }
     if (!sawVisibleUser || message.role !== "assistant" || !Array.isArray(message.content)) continue;
     if (message.content.some(block => Boolean(block) && typeof block === "object" && (block as Record<string, unknown>).type === "text" && String((block as Record<string, unknown>).text ?? "").trim())) finalTextAfterUser = true;
+    if (assistantMessageFailure(message)) terminalFailureAfterUser = true;
   }
-  return sawVisibleUser && !finalTextAfterUser;
+  return sawVisibleUser && !finalTextAfterUser && !terminalFailureAfterUser;
 }

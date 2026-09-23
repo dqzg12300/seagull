@@ -71,6 +71,13 @@ The operator's objective is:
     ])).toBe(true);
   });
 
+  it("does not misclassify an explicit provider failure as a missing final answer", () => {
+    expect(historyNeedsFinalResponse([
+      { role: "user", content: [{ type: "text", text: "inspect this" }] },
+      { role: "assistant", content: [], stopReason: "error", errorMessage: "400: invalid tool schema" },
+    ])).toBe(false);
+  });
+
   it.each(["补全上一轮最终答复", "Recover the previous final response"])("recognizes automatic recovery queue entries: %s", label => {
     expect(isFinalResponseRecoveryDisplayText(label)).toBe(true);
   });

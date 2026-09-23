@@ -10,6 +10,8 @@ import {
   type AgentSession,
 } from "@earendil-works/pi-coding-agent";
 import type { AppSettings, WorkerCommand, WorkerEvent } from "./shared.js";
+import { modelApiName, normalizeModelBaseUrl } from "./model-provider.js";
+import { agentTurnWillRetry } from "./agent-turn.js";
 import { buildInheritedWorkConversationContext, resolveUpstreamWorkIds, selectLegacySessionForWork, sessionBranchMessages, type InheritedWorkConversation, type WorkSessionLocator } from "./work-session.js";
 import mobileReverse from "../src/index.js";
 
@@ -72,6 +74,7 @@ function settingsFingerprint(settings?: AppSettings): string {
     settings?.baseUrl ?? "",
     settings?.apiKey ?? "",
     settings?.modelId ?? "",
+    settings?.apiProtocol ?? "openai",
   ])).digest("hex");
 }
 
@@ -257,10 +260,14 @@ async function initialize(nextCwd: string, caseId?: string, workId?: string, cas
       const runtimeDir = path.join(cwd, ".pi", "runtime");
       const modelsPath = path.join(runtimeDir, "models.json");
       await mkdir(runtimeDir, { recursive: true });
-      await writeFile(modelsPath, JSON.stringify({ providers: { seagull: {
-        baseUrl: settings.baseUrl.replace(/\/$/, ""), api: "openai-completions", models: [{ id: settings.modelId, name: settings.modelId, input: ["text", "image"] }],
-        compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
-      } } }, null, 2));
+      const apiProtocol = settings.apiProtocol ?? "openai";
+      const provider = {
+        baseUrl: normalizeModelBaseUrl(settings.baseUrl, apiProtocol),
+        api: modelApiName(apiProtocol),
+        models: [{ id: settings.modelId, name: settings.modelId, input: ["text", "image"] }],
+        ...(apiProtocol === "openai" ? { compat: { supportsDeveloperRole: false, supportsReasoningEffort: false } } : {}),
+      };
+      await writeFile(modelsPath, JSON.stringify({ providers: { seagull: provider } }, null, 2));
       modelRuntime = await ModelRuntime.create({ modelsPath, authPath: path.join(runtimeDir, "auth.json") });
       if (settings.apiKey) modelRuntime.setRuntimeApiKey("seagull", settings.apiKey);
       model = modelRuntime.getModel("seagull", settings.modelId);
@@ -285,7 +292,8 @@ async function initialize(nextCwd: string, caseId?: string, workId?: string, cas
   const unsubscribe = createdSession.subscribe(event => {
     if (session !== createdSession) return;
     send({ type: "agent-event", event: serializable(event) });
-    sendState((event as { type?: string }).type === "agent_end" ? false : undefined);
+    const terminalEnd = (event as { type?: string }).type === "agent_end" && !agentTurnWillRetry(event);
+    sendState(terminalEnd ? false : undefined);
   });
   const cached: CachedSession = {
     key: cacheKey,

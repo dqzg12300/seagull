@@ -17,6 +17,7 @@ describe("skills manager", () => {
     expect(names).toContain("android-protocol-recovery");
     expect(names).toContain("android-version-diff");
     expect(names).toContain("android-runtime-diagnostics");
+    expect(names).toContain("pcap-network-analysis");
   });
 
   it("searches bundled and curated skills", async () => {

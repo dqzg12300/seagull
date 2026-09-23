@@ -2,14 +2,17 @@
   "name": "pi-mobile-reverse",
   "version": "0.1.0",
   "description": "Android reverse-engineering workflow package for Pi with an MCP bridge",
+  "author": "Seagull Contributors",
   "type": "module",
   "private": true,
   "license": "MIT",
   "scripts": {
     "pi": "pi",
-    "app:dev": "electron-vite dev",
+    "app:dev": "node scripts/desktop-env-check.mjs && electron-vite dev",
     "app:build": "electron-vite build",
-    "app:preview": "electron-vite preview",
+    "app:preview": "node scripts/desktop-env-check.mjs && electron-vite preview",
+    "app:pack": "node scripts/desktop-env-check.mjs && node scripts/clean-pack-output.mjs && npm run app:build && electron-builder --dir --win",
+    "app:dist": "node scripts/desktop-env-check.mjs && node scripts/clean-pack-output.mjs && npm run app:build && electron-builder --win nsis portable",
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
@@ -24,6 +27,7 @@
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-web-links": "^0.12.0",
     "@xterm/xterm": "^6.0.0",
+    "archiver": "8.0.0",
     "lucide-react": "^1.28.0",
     "node-pty": "^1.1.0",
     "react": "^19.2.8",
@@ -39,11 +43,13 @@
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.83.0",
+    "@types/archiver": "8.0.0",
     "@types/node": "^24.0.0",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
     "@vitejs/plugin-react": "^5.1.4",
     "electron": "^43.2.0",
+    "electron-builder": "26.15.3",
     "electron-vite": "^5.0.0",
     "typescript": "^5.9.0",
     "vite": "^7.3.6",
@@ -59,5 +65,59 @@
     "prompts": [
       "./prompts"
     ]
+  },
+  "build": {
+    "appId": "com.seagull.mobile.reverse",
+    "productName": "Seagull Mobile Reverse",
+    "npmRebuild": false,
+    "electronDist": "node_modules/electron/dist",
+    "directories": {
+      "output": "release-app"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "skills",
+        "to": "app-resources/skills"
+      },
+      {
+        "from": "prompts",
+        "to": "app-resources/prompts"
+      }
+    ],
+    "asarUnpack": [
+      "node_modules/node-pty/**/*"
+    ],
+    "win": {
+      "signAndEditExecutable": false,
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "artifactName": "${productName}-${version}-${arch}-setup.${ext}",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-${arch}-portable.${ext}"
+    }
   }
 }

@@ -2,7 +2,7 @@ import { contextBridge, ipcRenderer } from "electron";
 import type { DesktopApi, RoutedWorkerEvent, TerminalEvent } from "./shared.js";
 
 const api: DesktopApi = {
-  apiVersion: 22,
+  apiVersion: 23,
   selectApk: () => ipcRenderer.invoke("desktop:select-apk"),
   selectCaseFiles: () => ipcRenderer.invoke("desktop:select-case-files"),
   selectProjectDirectory: () => ipcRenderer.invoke("desktop:select-project-directory"),
@@ -43,6 +43,7 @@ const api: DesktopApi = {
   updateQueuedPrompt: (caseId, workId, promptId, displayText) => ipcRenderer.invoke("agent:queue-update", caseId, workId, promptId, displayText),
   moveQueuedPrompt: (caseId, workId, promptId, direction) => ipcRenderer.invoke("agent:queue-move", caseId, workId, promptId, direction),
   deleteQueuedPrompt: (caseId, workId, promptId) => ipcRenderer.invoke("agent:queue-delete", caseId, workId, promptId),
+  resumePromptQueue: (caseId, workId) => ipcRenderer.invoke("agent:queue-resume", caseId, workId),
   readCase: caseId => ipcRenderer.invoke("case:read", caseId),
   listCases: () => ipcRenderer.invoke("case:list"),
   deleteCase: caseId => ipcRenderer.invoke("case:delete", caseId),
